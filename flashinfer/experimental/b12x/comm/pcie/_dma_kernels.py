@@ -1480,46 +1480,6 @@ class DmaKernels:
         stream = int(current_cuda_stream())
         self._ipc.cudaMemcpyAsync(int(dst_ptr), int(src_ptr), int(bytes_), stream)
 
-    def dma_copy_2d(
-        self,
-        dst_ptr: int,
-        dst_pitch_bytes: int,
-        src_ptr: int,
-        src_pitch_bytes: int,
-        width_bytes: int,
-        height: int,
-        *,
-        stream: int | None = None,
-    ) -> None:
-        """Pitched copy-engine copy between two device (possibly peer) addresses.
-
-        Wraps cudaMemcpy2DAsync on the current stream: width_bytes per row and
-        height rows, with independent destination and source row pitches.
-        Widths and pitches must be multiples of four bytes. This is a host-side
-        launch only, so it records one graph memcpy node and is valid only on
-        the carrier channel's bound stream and inside its capture contract;
-        every rank must serialize calls sharing that channel. Use it for peer
-        column pushes whose destination rows are strided instead of issuing one
-        copy per row.
-        """
-
-        dst_pitch, src_pitch = int(dst_pitch_bytes), int(src_pitch_bytes)
-        width, rows = int(width_bytes), int(height)
-        if dst_pitch <= 0 or src_pitch <= 0 or width <= 0 or rows <= 0:
-            raise ValueError(
-                "pitched copy requires a positive width, height and pitches"
-            )
-        if width % 4 or dst_pitch % 4 or src_pitch % 4:
-            raise ValueError(
-                "pitched copy requires four-byte aligned widths and pitches"
-            )
-        if width > src_pitch or width > dst_pitch:
-            raise ValueError("pitched copy row width exceeds a row pitch")
-        carrier = int(current_cuda_stream()) if stream is None else int(stream)
-        self._ipc.cudaMemcpy2DAsync(
-            int(dst_ptr), dst_pitch, int(src_ptr), src_pitch, width, rows, carrier
-        )
-
     def dma_set_flag(self, peer_flag_ptr: int, counter_ptr: int) -> None:
         raw = self._require_launchers().set_flag
         raw(

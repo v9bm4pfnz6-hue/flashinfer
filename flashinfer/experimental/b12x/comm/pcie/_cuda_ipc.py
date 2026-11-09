@@ -66,20 +66,6 @@ class CudaRTLibrary:
             ],
         ),
         _Function(
-            "cudaMemcpy2DAsync",
-            cudaError_t,
-            [
-                ctypes.c_void_p,
-                ctypes.c_size_t,
-                ctypes.c_void_p,
-                ctypes.c_size_t,
-                ctypes.c_size_t,
-                ctypes.c_size_t,
-                cudaMemcpyKind,
-                cudaStream_t,
-            ],
-        ),
-        _Function(
             "cudaIpcGetMemHandle",
             cudaError_t,
             [ctypes.POINTER(cudaIpcMemHandle_t), ctypes.c_void_p],
@@ -151,31 +137,6 @@ class CudaRTLibrary:
                 cudaStream_t(int(stream)),
             ),
             "cudaMemcpyAsync",
-        )
-
-    def cudaMemcpy2DAsync(
-        self,
-        dst: int | ctypes.c_void_p,
-        dst_pitch_bytes: int,
-        src: int | ctypes.c_void_p,
-        src_pitch_bytes: int,
-        width_bytes: int,
-        height: int,
-        stream: int,
-    ) -> None:
-        cudaMemcpyDefault = 4
-        self._check(
-            self.funcs["cudaMemcpy2DAsync"](
-                self._void_p(dst),
-                int(dst_pitch_bytes),
-                self._void_p(src),
-                int(src_pitch_bytes),
-                int(width_bytes),
-                int(height),
-                cudaMemcpyDefault,
-                cudaStream_t(int(stream)),
-            ),
-            "cudaMemcpy2DAsync",
         )
 
     def cudaIpcGetMemHandleBytes(self, ptr: int | ctypes.c_void_p) -> bytes:
