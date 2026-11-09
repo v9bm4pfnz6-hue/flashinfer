@@ -107,7 +107,7 @@ def _configs(query, device=None):
             continue
         yield CollectiveConfig(implementation=name, threads=threads, blocks=blocks)
         if (
-            query.world_size in (2, 3, 4, 6, 8, 10)
+            query.world_size in (2, 3, 4, 6, 8, 9, 10)
             and query.operation == "all_reduce"
             and call.get("stage_input")
             and call.get("dtype") in ("float16", "bfloat16")
@@ -531,7 +531,7 @@ def oneshot_alternatives(query, runtime):
             for variant in ((True, 0), (True, 1))
         )
         valid_graph = (
-            query.world_size in (2, 3, 4, 6, 8, 10)
+            query.world_size in (2, 3, 4, 6, 8, 9, 10)
             and query.call["dtype"] in ("float16", "bfloat16")
             and graph_slots
             and 0 < packs <= min(capacity, 0x7FFFFFFF)

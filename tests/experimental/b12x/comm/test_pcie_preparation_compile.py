@@ -104,7 +104,71 @@ def test_dcp_attention_accepts_non_power_of_two_groups(world, owner, operation):
     assert layout.staging1_offset == layout.staging0_offset + layout.slot_bytes
 
 
-@pytest.mark.parametrize("world", [9, 10, 12])
+@pytest.mark.parametrize("owner", ["DcpAllToAll", "DcpAllToAllPool"])
+@pytest.mark.parametrize("operation", ["all_gather_pair", "kimi_topk16"])
+def test_kimi_projection_shards_accept_tp9(owner, operation):
+    query = PcieQuery(
+        surface=f"{owner}.{operation}",
+        world_size=9,
+        rank=8,
+        topology="pcie_ipc",
+        call=FrozenMapping(),
+        setup=FrozenMapping(),
+    )
+    TUNING.validate_query(query, None)
+
+
+@pytest.mark.parametrize("rows", [1, 8, 16, 32])
+def test_kimi_topk16_admits_speculative_rows(rows):
+    from types import SimpleNamespace
+    from b12x.comm.pcie.pcie_dcp_a2a import PCIeDCPA2A
+
+    runtime = PCIeDCPA2A.__new__(PCIeDCPA2A)
+    runtime.device = torch.device("cpu")
+    runtime.max_batch_size = 32
+    runtime._closed = False
+    launches = []
+    runtime._launch_kimi_topk16 = lambda *args, **kwargs: launches.append((args, kwargs))
+    state = SimpleNamespace(launcher=lambda capture: None)
+    logits = torch.zeros((rows, 896), dtype=torch.float32)
+    bias = torch.zeros(896, dtype=torch.float32)
+
+    weights, ids = runtime._kimi_topk16_on_device(logits, bias, None, None, state=state, threads=256)
+
+    assert weights.shape == ids.shape == (rows, 16)
+    assert len(launches) == 1 and launches[0][1]["threads"] == 256
+
+
+@pytest.mark.parametrize("rows", [0, 33])
+def test_kimi_topk16_rejects_rows_above_speculative_capacity(rows):
+    from types import SimpleNamespace
+    from b12x.comm.pcie.pcie_dcp_a2a import PCIeDCPA2A
+
+    runtime = PCIeDCPA2A.__new__(PCIeDCPA2A)
+    runtime.device = torch.device("cpu")
+    runtime.max_batch_size = 32
+    runtime._closed = False
+    with pytest.raises(ValueError, match="capacity"):
+        runtime._kimi_topk16_on_device(torch.zeros((rows, 896)), torch.zeros(896), None, None,
+                                       state=SimpleNamespace(), threads=256)
+
+
+@pytest.mark.parametrize("owner", ["DcpAllToAll", "DcpAllToAllPool"])
+def test_fused_kimi_projection_shards_reject_tp9(owner):
+    query = PcieQuery(
+        surface=f"{owner}.all_gather_pair_kimi_topk",
+        world_size=9,
+        rank=0,
+        topology="pcie_ipc",
+        call=FrozenMapping(),
+        setup=FrozenMapping(),
+    )
+    with pytest.raises(ValueError, match="supports world sizes"):
+        TUNING.validate_query(query, None)
+
+
+@pytest.mark.parametrize("world", [10, 12])
+@pytest.mark.parametrize("owner", ["DcpAllToAll", "DcpAllToAllPool"])
 @pytest.mark.parametrize(
     "operation",
     [
@@ -113,11 +177,9 @@ def test_dcp_attention_accepts_non_power_of_two_groups(world, owner, operation):
         "kimi_topk16",
     ],
 )
-def test_attention_group_support_does_not_enable_kimi_projection_shards(
-    world, operation
-):
+def test_kimi_projection_shards_reject_unsupported_groups(world, owner, operation):
     query = PcieQuery(
-        surface=f"DcpAllToAll.{operation}",
+        surface=f"{owner}.{operation}",
         world_size=world,
         rank=0,
         topology="pcie_ipc",

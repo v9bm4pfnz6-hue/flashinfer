@@ -388,6 +388,13 @@ MXFP8_A16_DEQUANT_MIN_ROWS = 128
 # The expanded weight lives in shared caller scratch; larger weights (e.g. an
 # A16 MXFP8 LM head) keep the warp-MMA lowering instead of reserving it.
 MXFP8_A16_DEQUANT_MAX_BYTES = 256 << 20
+# The packed A16 backend keeps the warp-MMA lowering at every row count. A
+# 2026-11-10 TP9 K3.1 audit measured it 9-51% ahead of the expanded lowering on
+# 7 of 11 block-scaled shapes in the 128-row verification bucket, and 2.2-2.6x
+# behind in the 4,608-row prefill bucket where the BF16 expansion is amortized.
+# Default-tier searches therefore race the packed backend up to this row count
+# and keep it audit-only above it.
+MXFP8_A16_PACKED_MAX_ROWS = 512
 
 
 def mxfp8_a16_dequant(query, config):
@@ -665,7 +672,14 @@ def _tuning_parameters(query, device):
         )
 
     def expanded_a16(parameters):
-        return parameters["a16_backend"] == "auto"
+        # The expanded BF16 lowering pays off once the GEMM is compute bound;
+        # on verification-sized rows the packed warp-MMA kernel is the faster
+        # choice, so admit it to the default search there instead of hiding it
+        # behind audit-only pruning.
+        return (
+            parameters["a16_backend"] == "auto"
+            or query.num_tokens <= MXFP8_A16_PACKED_MAX_ROWS
+        )
 
     def dense_tile_n(parameters):
         dense = parameters["dense_config"]

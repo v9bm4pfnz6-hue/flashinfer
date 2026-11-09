@@ -8,7 +8,7 @@ from b12x.comm.pcie import _dma_kernels as dma_kernels
 from b12x.comm.pcie import pcie_dma
 
 
-@pytest.mark.parametrize("world_size", [1, 3, 5, 7, 9, 11, 12])
+@pytest.mark.parametrize("world_size", [1, 5, 7, 11, 12])
 def test_dma_rejects_unreviewed_world_sizes_before_backend_setup(
     monkeypatch: pytest.MonkeyPatch,
     world_size: int,
@@ -30,7 +30,10 @@ def test_dma_rejects_unreviewed_world_sizes_before_backend_setup(
 
 
 def test_dma_reviewed_world_sizes_match_tp10_accumulator_limit() -> None:
-    assert pcie_dma.SUPPORTED_WORLD_SIZES == (2, 4, 6, 8, 10)
+    from b12x.comm.pcie._tuning import SURFACES
+
+    assert pcie_dma.SUPPORTED_WORLD_SIZES == (2, 3, 4, 6, 8, 9, 10)
+    assert SURFACES["DmaAllReduce.all_reduce"] == pcie_dma.SUPPORTED_WORLD_SIZES
     assert max(pcie_dma.SUPPORTED_WORLD_SIZES) - 1 == 9
 
 

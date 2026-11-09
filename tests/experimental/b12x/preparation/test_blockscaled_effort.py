@@ -120,3 +120,37 @@ def test_effort_is_captured_in_declaration_but_excluded_from_program_key(monkeyp
     assert payload == _compile_query_payload(replace(q, autotune_effort="off"))
     assert "autotune_effort" not in payload
     assert _decode_query(payload).autotune_effort == "default"
+
+
+def test_packed_a16_backend_is_raced_at_default_for_verification_rows():
+    verification = BlockscaledQuery(
+        recipe="mxfp8",
+        num_tokens=128,
+        in_features=7168,
+        padded_in_features=7168,
+        out_features=1408,
+        activation_mode="a16",
+        allow_bf16_atomic_reduction=False,
+        workspace_form="provided",
+        workspace_nbytes=64 << 20,
+    )
+    space = TUNING.parameter_space(verification, DEVICE)
+    assert "packed" in {
+        assignment["a16_backend"] for assignment in space.configurations()
+    }
+    assert "packed" in {
+        assignment["a16_backend"]
+        for assignment in replace(space, autotune_effort="audit").configurations()
+    }
+
+    # The expanded BF16 lowering wins once the weight expansion is amortized;
+    # the prefill bucket keeps the packed backend audit-only.
+    prefill = replace(verification, num_tokens=4608)
+    space = TUNING.parameter_space(prefill, DEVICE)
+    assert "packed" not in {
+        assignment["a16_backend"] for assignment in space.configurations()
+    }
+    assert "packed" in {
+        assignment["a16_backend"]
+        for assignment in replace(space, autotune_effort="audit").configurations()
+    }

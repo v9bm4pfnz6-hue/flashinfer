@@ -269,7 +269,7 @@ class _OneshotLaunch(_PackedMath):
                 "input on two ranks"
             )
         if transport in ("remote_push_ll", "remote_push_simple") and (
-            world_size not in (2, 3, 4, 6, 8, 10)
+            world_size not in (2, 3, 4, 6, 8, 9, 10)
             or not 0 <= rank < world_size
             or not stage_input
             or not device_slot_selection
@@ -279,7 +279,7 @@ class _OneshotLaunch(_PackedMath):
                 "tagged peer push requires graph-owned staged FP16/BF16 input"
             )
         if transport in ("remote_push_full", "remote_push_rsag") and (
-            world_size not in (2, 3, 4, 6, 8, 10)
+            world_size not in (2, 3, 4, 6, 8, 9, 10)
             or not stage_input
             or not device_slot_selection
             or dtype_name != "bfloat16"

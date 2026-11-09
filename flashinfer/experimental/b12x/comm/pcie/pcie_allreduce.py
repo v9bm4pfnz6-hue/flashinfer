@@ -114,7 +114,7 @@ def recommended_max_bytes(world_size: int, *, default: int = DEFAULT_MAX_SIZE) -
     return default
 
 
-MAX_DIRECT_WORLD_SIZE = 8
+MAX_DIRECT_WORLD_SIZE = 9
 DIRECT_WORLD_SIZES = tuple(
     world_size
     for world_size in ONESHOT_WORLD_SIZES

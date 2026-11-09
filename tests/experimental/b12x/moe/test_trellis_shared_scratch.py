@@ -1,5 +1,6 @@
 """Frozen input-transform geometry controls storage without changing arithmetic."""
 
+from contextlib import ExitStack
 from dataclasses import replace
 import importlib.util
 import math
@@ -276,6 +277,65 @@ def test_frozen_and_generic_bindings_preserve_shapes_and_values(
             assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
             assert torch.equal(generic.output, compact.output)
             assert torch.all(compact.output[rows:] == 7)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_full_rotation_resets_barrier_for_every_shared_arena_replay(tmp_path):
+    if torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("SM120/SM121 execution required")
+    helper = _helpers()
+    source, weights = _source(helper, tmp_path, 17)
+    geometry = helper.fused_moe.MoEGeometry(
+        num_experts=17, hidden_size=512, intermediate_size=256
+    )
+    experts = helper.prepare_experts(source, weights, geometry, torch.bfloat16)
+    with ExitStack() as stack:
+        runners = {}
+        for rows in (128, 4096):
+            x, ids, routes = helper.inputs(
+                rows, 512, 17, 4, torch.bfloat16, seed=4463 + rows
+            )
+            runners[rows] = stack.enter_context(
+                helper.prepared_runner(
+                    experts, x, ids, routes, freeze_transform=False
+                )
+            )
+        storage = torch.empty(
+            max(
+                runner.scratch_plan.layout.total_nbytes
+                for runner in runners.values()
+            ),
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        for rows, runner in runners.items():
+            x, ids, routes = helper.inputs(
+                rows, 512, 17, 4, torch.bfloat16, seed=4463 + rows
+            )
+            runner.binding = runner.scratch_plan.bind(
+                scratch=storage,
+                a=x,
+                experts=experts._impl,
+                topk_ids=ids,
+                topk_weights=routes,
+                output=runner.output,
+            )
+            runner.capture()
+
+        small = runners[128]
+        small.graph.replay()
+        torch.cuda.synchronize()
+        expected = small.output.clone()
+        assert small.binding.kernel_workspace[-2:].tolist() == [0, 3]
+
+        runners[4096].graph.replay()
+        torch.cuda.synchronize()
+        small.binding.kernel_workspace.fill_(0xA5)
+        small.graph.replay()
+        torch.cuda.synchronize()
+
+        assert torch.equal(small.output, expected)
+        assert small.binding.kernel_workspace[-2:].tolist() == [0, 3]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

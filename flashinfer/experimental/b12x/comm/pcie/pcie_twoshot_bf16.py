@@ -52,7 +52,7 @@ from .pcie_twoshot import (
 )
 
 _PACK_ELEMS = 8
-SUPPORTED_WORLD_SIZES = (2, 3, 4, 6, 8, 10)
+SUPPORTED_WORLD_SIZES = (2, 3, 4, 6, 8, 9, 10)
 _SCALAR_PEERS = 16
 
 

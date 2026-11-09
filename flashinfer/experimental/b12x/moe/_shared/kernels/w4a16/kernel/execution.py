@@ -1006,6 +1006,12 @@ def run_w4a16_moe(
             _w4a16_small_m_direct_launch_flat(*launch_args, launcher=direct_launch)
         return output
 
+    if full_rotation:
+        # Cooperative grid barriers live in caller-owned scratch, which can be
+        # reused by another capacity between launches. Reset them in the launch
+        # stream so warmup and every captured replay start with count zero.
+        prepared.workspace.zero_()
+
     if isinstance(fused_launch, W4A16SmallMDirectCompileResult):
         raise RuntimeError("execution does not match its prepared native W4A16 route")
 

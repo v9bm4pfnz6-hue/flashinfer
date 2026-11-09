@@ -58,7 +58,7 @@ from ._twoshot_cute import (
 )
 
 _PACK_ELEMS = 8  # bf16 values per 16-byte pack
-_SUPPORTED_WORLD_SIZES = (2, 3, 4, 6, 8, 10)
+_SUPPORTED_WORLD_SIZES = (2, 3, 4, 6, 8, 9, 10)
 
 
 @dsl_user_op

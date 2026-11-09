@@ -177,6 +177,15 @@ class _Verify:
                     ),
                     byte_alignment=16,
                 )
+                bias_values = smem.allocate_tensor(
+                    Float32, cute.make_layout((128,), stride=(1,)), byte_alignment=16
+                )
+                for step in cutlass.range_constexpr((128 + threads - 1) // threads):
+                    index = tid + step * threads
+                    if index < 128:
+                        bias_values[index] = Float32(
+                            bias[head.to(Int64) * self.strides[5] + index.to(Int64)]
+                        )
                 a = cute.math.exp(Float32(a_log[head]), fastmath=False)
                 for step in cutlass.range_constexpr((self.window + warps - 1) // warps):
                     pos = warp + step * warps
@@ -212,6 +221,7 @@ class _Verify:
                                 Float32(vectors[0, pos, k]) * qinv * scale
                             )
                             vectors[1, pos, k] = Float32(vectors[1, pos, k]) * kinv
+                cute.arch.sync_threads()
                 for step in cutlass.range_constexpr(
                     (self.window * 128 + threads - 1) // threads
                 ):
@@ -227,9 +237,7 @@ class _Verify:
                                 + column.to(Int64)
                             ]
                         )
-                        biased = raw + Float32(
-                            bias[head.to(Int64) * self.strides[5] + column.to(Int64)]
-                        )
+                        biased = raw + Float32(bias_values[column])
                         activated = lower / (
                             1.0 + cute.math.exp(-a * biased, fastmath=False)
                         )
@@ -396,11 +404,18 @@ class _Commit:
                 )
             smem = cutlass.utils.SmemAllocator()
             vectors = smem.allocate_tensor(
-                Float32, cute.make_layout((2, 128), stride=(128, 1)), byte_alignment=16
+                Float32, cute.make_layout((3, 128), stride=(128, 1)), byte_alignment=16
             )
+            for offset in cutlass.range_constexpr((127 + self.block_v * 8) // (self.block_v * 8)):
+                index = tid + offset * self.block_v * 8
+                if index < 128:
+                    vectors[2, index] = Float32(
+                        bias[Int64(layer_head) * 128 + index.to(Int64)]
+                    )
             a = cute.math.exp(Float32(a_log[Int64(layer_head)]), fastmath=False)
             boundary = Int64(boundaries[request])
             boundary_length = Int32(boundary_lengths[request])
+            cute.arch.sync_threads()
             for pos in cutlass.range(length):
                 if tid < 32:
                     ksum = Float32(0.0)
@@ -417,9 +432,7 @@ class _Commit:
                         vectors[0, k] = Float32(vectors[0, k]) * kinv
                 if tid < 128:
                     raw = Float32(kg[kg_base + Int64(pos) * 256 + 128 + tid.to(Int64)])
-                    biased = raw + Float32(
-                        bias[Int64(layer_head) * 128 + tid.to(Int64)]
-                    )
+                    biased = raw + Float32(vectors[2, tid])
                     activated = lower / (
                         1.0 + cute.math.exp(-a * biased, fastmath=False)
                     )

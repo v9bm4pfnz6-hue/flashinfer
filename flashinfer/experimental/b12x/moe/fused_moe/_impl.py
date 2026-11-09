@@ -3220,11 +3220,8 @@ def _build_tp_moe_fp4_binding_from_views(
             output = tensors["full_rotation_output"][:m]
         else:
             output = output[:m]
-        # The persistent fused kernel uses this scratch for grid-barrier state.
-        # Unlike the ordinary W4A16 prepared object, this arena is caller-owned
-        # and may contain arbitrary bytes on its first bind. Record one zero-fill
-        # in the same stream as the launch; when bind occurs during CUDA graph
-        # capture the initialization is replayed with the graph as required.
+        # Initialize caller-owned barrier state on first bind. Each execution
+        # also resets it in the launch stream before the cooperative kernel.
         tensors["kernel_workspace"].zero_()
 
     common_kwargs = dict(
