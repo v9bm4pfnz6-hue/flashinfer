@@ -95,3 +95,12 @@ def test_owner_rounding_preserves_extreme_exponents():
         reference = _chain_sum(partials, owner).bfloat16()
         forwarded = _bf16_gather_result(partials, owner).bfloat16()
         assert torch.equal(reference.view(torch.uint8), forwarded.view(torch.uint8))
+
+def test_ring_channel_geometry_helpers_are_importable():
+    from b12x.comm.pcie.pcie_dma import PCIeDmaAllReduce, _align_up
+
+    assert _align_up(1, 256) == 256
+    assert _align_up(256, 256) == 256
+    assert _align_up(257, 256) == 512
+    assert PCIeDmaAllReduce.__name__ == "PCIeDmaAllReduce"
+

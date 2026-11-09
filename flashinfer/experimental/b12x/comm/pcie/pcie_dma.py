@@ -158,6 +158,10 @@ def _load_kernels(ipc: CudaRTLibrary) -> DmaKernels:
     return DmaKernels(ipc)
 
 
+def _align_up(value: int, alignment: int) -> int:
+    return (value + alignment - 1) // alignment * alignment
+
+
 def bf16_gather_layout(numel: int, world_size: int, pieces: int) -> tuple[int, int, int]:
     """Validate one packet and return (shard_elems, fp32_piece_bytes, wire_piece_bytes).
 
