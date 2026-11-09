@@ -254,7 +254,7 @@ class DenseMlaForwardKernel:
                     Float32(0.0),
                     Float32(0.0),
                 ]
-                probability, warp_scale0, warp_scale1 = online_softmax(
+                probability, warp_scale0, warp_scale1, block_scale0, block_scale1 = online_softmax(
                     qk,
                     probability,
                     accumulator,
@@ -283,7 +283,8 @@ class DenseMlaForwardKernel:
                         weight_addr,
                         local_warp,
                         lane,
-                        local_tid,
+                        block_scale0,
+                        block_scale1,
                         record_stride_bytes=self.layout.record_stride_bytes,
                         barrier_id=barrier_id,
                         value_dim=self.value_dim,
