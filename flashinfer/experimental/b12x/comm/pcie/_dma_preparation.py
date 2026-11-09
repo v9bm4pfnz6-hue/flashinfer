@@ -40,16 +40,28 @@ def query_from_runtime(runtime, *, surface: str, call) -> PcieQuery:
         {
             "max_bytes": int(runtime.max_bytes),
             "wire_mode": str(runtime._fp8),
+            "bf16_gather": bool(runtime._bf16_gather),
             "pieces_override": int(runtime._pieces_override),
             "a2a_chunks_override": int(runtime._a2a_chunks_override),
             **dict(call),
         }
     )
-    _require(values, "max_bytes", "wire_mode", "pieces_override", "a2a_chunks_override")
+    _require(
+        values,
+        "max_bytes",
+        "wire_mode",
+        "bf16_gather",
+        "pieces_override",
+        "a2a_chunks_override",
+    )
     if int(values["max_bytes"]) != int(runtime.max_bytes):
         raise ValueError("DMA preparation max_bytes differs from its runtime channel")
     if str(values["wire_mode"]) != runtime._fp8:
         raise ValueError("DMA preparation wire mode differs from its runtime channel")
+    if bool(values["bf16_gather"]) != bool(runtime._bf16_gather):
+        raise ValueError(
+            "DMA preparation BF16 broadcast mode differs from its runtime channel"
+        )
     if (
         int(values["pieces_override"]) != runtime._pieces_override
         or int(values["a2a_chunks_override"]) != runtime._a2a_chunks_override
@@ -69,6 +81,9 @@ def query_from_runtime(runtime, *, surface: str, call) -> PcieQuery:
             if runtime._fp8_stage is None
             else int(runtime._fp8_stage.numel()),
             "stage_stride": int(runtime._fp8_stage_stride),
+            "bf16_stage_nbytes": 0
+            if runtime._bf16_stage is None
+            else int(runtime._bf16_stage.numel()),
         }
     )
     return PcieQuery(
@@ -215,6 +230,7 @@ def plan(
         required = (
             int(query.setup["slab_nbytes"])
             + int(query.setup["stage_nbytes"])
+            + int(query.setup["bf16_stage_nbytes"])
             + 3 * int(query.setup["flag_slots"]) * 4
         )
         # The runtime owns its IPC slab/stage before declaration; preparation

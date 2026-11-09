@@ -158,8 +158,57 @@ def _load_kernels(ipc: CudaRTLibrary) -> DmaKernels:
     return DmaKernels(ipc)
 
 
-def _align_up(value: int, alignment: int) -> int:
-    return (value + alignment - 1) // alignment * alignment
+def bf16_gather_layout(numel: int, world_size: int, pieces: int) -> tuple[int, int, int]:
+    """Validate one packet and return (shard_elems, fp32_piece_bytes, wire_piece_bytes).
+
+    The BF16 broadcast phase halves only the all-gather payload of an FP32
+    owner packet, so every geometric requirement of the lossless ring stays in
+    force: eight-element FP32 groups per rank, whole pieces, and 16-byte
+    aligned wire regions for the copy engine.
+    """
+
+    if world_size not in SUPPORTED_WORLD_SIZES:
+        raise ValueError(
+            "BF16 broadcast phase supports only the reviewed world sizes "
+            f"{SUPPORTED_WORLD_SIZES}, got {world_size}"
+        )
+    if numel <= 0 or numel % (world_size * 8):
+        raise ValueError(
+            "BF16 broadcast phase requires an FP32 packet whose element count "
+            "is a multiple of world_size * 8"
+        )
+    if pieces not in (1, 2, 4, 8):
+        raise ValueError("BF16 broadcast phase supports one, two, four or eight pieces")
+    shard_elems = numel // world_size
+    if shard_elems % (pieces * 8):
+        raise ValueError(
+            "BF16 broadcast pieces must cover whole eight-element FP32 groups"
+        )
+    fp32_piece_bytes = shard_elems // pieces * 4
+    wire_piece_bytes = fp32_piece_bytes // 2
+    if fp32_piece_bytes % 32 or wire_piece_bytes % 16:
+        raise ValueError("BF16 broadcast requires 16-byte aligned wire payloads")
+    return shard_elems, fp32_piece_bytes, wire_piece_bytes
+
+
+def _device_view(
+    address: int, numel: int, dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """Non-owning view over runtime-owned CUDA storage for exact dtype converts."""
+
+    nbytes = int(numel) * torch.empty((), dtype=dtype).element_size()
+    storage = torch._C._construct_storage_from_data_pointer(
+        int(address), device, int(nbytes)
+    )
+    return torch._C._construct_CUDA_Tensor_From_Storage_And_Metadata(
+        {
+            "dtype": dtype,
+            "size": (int(numel),),
+            "stride": (1,),
+            "storage_offset": 0,
+        },
+        storage,
+    )
 
 
 class PCIeDmaAllReduce:
@@ -168,6 +217,11 @@ class PCIeDmaAllReduce:
     A channel is a single ordered stream context; concurrent use from
     multiple CUDA streams needs separate channels (same contract as the
     oneshot runtime).
+
+    A channel prepared with bf16_gather=True keeps the lossless ordered FP32
+    reduce-scatter but rounds each fully reduced owner chunk once to BF16 and
+    broadcasts those bits, halving the all-gather wire. Callers that store the
+    FP32 result in BF16 receive the identical bits.
     """
 
     def __init__(
@@ -178,6 +232,7 @@ class PCIeDmaAllReduce:
         max_bytes: int,
         ext_module=None,
         fp8: Optional[str] = None,
+        bf16_gather: bool = False,
         ipc=None,
     ) -> None:
         # Kept only as a source-compatible keyword for callers that used to
@@ -261,6 +316,24 @@ class PCIeDmaAllReduce:
                 self.world_size * stride, dtype=torch.uint8, device=self.device
             )
             self._fp8_stage_stride = stride
+        if bf16_gather and self._fp8:
+            raise ValueError(
+                "BF16 broadcast phase cannot combine with a compressed wire mode"
+            )
+        self._bf16_gather = bool(bf16_gather)
+        self._bf16_stage = None
+        if self._bf16_gather:
+            # One fully reduced chunk per rank: the ring serializes its calls,
+            # so a single aligned stage forwards every owner rounding.
+            stage_bytes = self.max_bytes // self.world_size // 2
+            stage_bytes -= stage_bytes % SCRATCH_ALIGN
+            if stage_bytes <= 0:
+                raise ValueError(
+                    "BF16 broadcast stage requires a positive aligned chunk"
+                )
+            self._bf16_stage = torch.empty(
+                stage_bytes, dtype=torch.uint8, device=self.device
+            )
         self._pieces_override = int(os.getenv("B12X_PCIE_DMA_PIECES", "0"))
         self._a2a_chunks_override = int(os.getenv("B12X_PCIE_DMA_A2A_CHUNKS", "0"))
         self.min_bytes = 0
@@ -308,6 +381,12 @@ class PCIeDmaAllReduce:
         if size_bytes < self.min_bytes:
             return False
         return inp.is_contiguous() and size_bytes <= self.max_bytes
+
+    @property
+    def bf16_gather(self) -> bool:
+        """True when the all-gather phase forwards a single BF16 owner rounding."""
+
+        return self._bf16_gather
 
     def prepare_eager_replay(
         self, dtype: torch.dtype, *, max_elements: int | None = None
@@ -446,6 +525,8 @@ class PCIeDmaAllReduce:
                 graph.replay()
                 out.view(-1).copy_(result[:elements])
                 return out
+        if self._bf16_gather:
+            return self._run_bf16_gather(inp, out)
         kernels = self._kernels
         world = self.world_size
         rank = self.rank
@@ -693,6 +774,168 @@ class PCIeDmaAllReduce:
         # Neighbor handshake so the next call (or graph replay) cannot
         # overwrite scratch a lagging neighbor still reads. The main stream
         # must also drain the copy and flag streams before the op is done.
+        main.wait_stream(copy_stream)
+        main.wait_stream(flag_stream)
+        done = steps * pieces
+        kernels.dma_set_flag(
+            self._flag_ptr(prv, done), self._counter_ptr(self._send_counters, done)
+        )
+        kernels.dma_wait_flag(
+            self._flag_ptr(rank, done), self._counter_ptr(self._wait_counters, done)
+        )
+        return out
+
+    def _run_bf16_gather(self, inp: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        """Ordered FP32 reduce-scatter with a lossless BF16 all-gather phase.
+
+        The reduce-scatter phase is the lossless ring's ordered FP32
+        accumulation and writes the same partially reduced chunks into the
+        output in the same element and hop order. After the last reduce step
+        the owner of each fully reduced chunk converts it to BF16 exactly once
+        with the same round-to-nearest conversion the caller's final BF16 store
+        performs, forwards those bits around the all-gather ring, and every
+        rank widens the received payload back into the FP32 output. A caller
+        that stores the FP32 result in BF16 therefore observes the identical
+        bits while the all-gather wire carries half the bytes.
+
+        The mode is a channel declaration, not a numerics change: the reduce
+        order is untouched and the single rounding happens at the same value
+        the caller would round.
+        """
+
+        if inp.dtype != torch.float32 or out.dtype != torch.float32:
+            raise ValueError(
+                "BF16 broadcast phase requires an FP32 owner packet input and output"
+            )
+        kernels = self._kernels
+        world = self.world_size
+        rank = self.rank
+        nxt = (rank + 1) % world
+        prv = (rank - 1) % world
+        dtype_code = SUPPORTED_DTYPES[inp.dtype]
+        elem = inp.element_size()
+        packet_shard_bytes = inp.numel() // world * elem
+        pieces = self._pick_pieces(inp.numel() // world, packet_shard_bytes)
+        shard_elems, piece_bytes, wire_bytes = bf16_gather_layout(
+            inp.numel(), world, pieces
+        )
+        piece_elems = shard_elems // pieces
+        shard_bytes = shard_elems * elem
+        if shard_elems * 2 > int(self._bf16_stage.numel()):
+            raise ValueError("BF16 broadcast stage cannot hold one reduced chunk")
+        steps = 2 * (world - 1)
+        stage = self._bf16_stage.data_ptr()
+        main = torch.cuda.current_stream(self.device)
+        copy_stream = self._copy_stream
+        flag_stream = self._flag_stream
+        add_done = self._piece_events
+        copied = self._copied_events
+        in_base, out_base = inp.data_ptr(), out.data_ptr()
+        self._input_ready.record(main)
+        copy_stream.wait_event(self._input_ready)
+        flag_stream.wait_event(self._input_ready)
+
+        def piece_ptr(chunk: int, piece: int) -> int:
+            return out_base + chunk * shard_bytes + piece * piece_bytes
+
+        def in_piece_ptr(chunk: int, piece: int) -> int:
+            return in_base + chunk * shard_bytes + piece * piece_bytes
+
+        def scratch_fp32(owner: int, step: int, piece: int) -> int:
+            return self._scratch_ptr(owner, step) + piece * piece_bytes
+
+        def scratch_wire(owner: int, step: int, piece: int) -> int:
+            return self._scratch_ptr(owner, step) + piece * wire_bytes
+
+        def stage_piece(piece: int) -> int:
+            return stage + piece * wire_bytes
+
+        def slot(step: int, piece: int) -> int:
+            return step * pieces + piece
+
+        for k in range(steps):
+            reduce_phase = k < world - 1
+            if reduce_phase:
+                send_chunk = (rank - k) % world
+                recv_chunk = (rank - k - 1) % world
+            else:
+                send_chunk = (rank + 1 - (k - (world - 1))) % world
+                recv_chunk = (rank - (k - (world - 1))) % world
+            if k == world - 1:
+                # The previous reduce step finalized this rank's owned chunk.
+                # Round it once; the first all-gather send waits on the event.
+                for p in range(pieces):
+                    _device_view(
+                        stage_piece(p), piece_elems, torch.bfloat16, self.device
+                    ).copy_(
+                        _device_view(
+                            piece_ptr(send_chunk, p),
+                            piece_elems,
+                            torch.float32,
+                            self.device,
+                        )
+                    )
+                self._ag_ready.record(main)
+            for p in range(pieces):
+                if reduce_phase:
+                    send_bytes = piece_bytes
+                    send_src = (
+                        in_piece_ptr(send_chunk, p)
+                        if k == 0
+                        else piece_ptr(send_chunk, p)
+                    )
+                    send_dst = scratch_fp32(nxt, k, p)
+                elif k == world - 1:
+                    send_bytes = wire_bytes
+                    send_src = stage_piece(p)
+                    send_dst = scratch_wire(nxt, k, p)
+                else:
+                    send_bytes = wire_bytes
+                    send_src = scratch_wire(rank, k - 1, p)
+                    send_dst = scratch_wire(nxt, k, p)
+                with torch.cuda.stream(copy_stream):
+                    if k == world - 1:
+                        copy_stream.wait_event(self._ag_ready)
+                    elif k > 0:
+                        copy_stream.wait_event(add_done[p])
+                    kernels.dma_copy(send_dst, send_src, send_bytes)
+                    copied[slot(k, p)].record(copy_stream)
+                with torch.cuda.stream(flag_stream):
+                    flag_stream.wait_event(copied[slot(k, p)])
+                    kernels.dma_set_flag(
+                        self._flag_ptr(nxt, slot(k, p)),
+                        self._counter_ptr(self._send_counters, slot(k, p)),
+                    )
+                wait = (
+                    self._flag_ptr(rank, slot(k, p)),
+                    self._counter_ptr(self._wait_counters, slot(k, p)),
+                    self._counter_ptr(self._wait_done, slot(k, p)),
+                )
+                if reduce_phase:
+                    kernels.dma_add(
+                        piece_ptr(recv_chunk, p),
+                        in_piece_ptr(recv_chunk, p),
+                        scratch_fp32(rank, k, p),
+                        piece_elems,
+                        dtype_code,
+                        wait=wait,
+                    )
+                else:
+                    kernels.dma_wait_flag(*wait[:2])
+                add_done[p].record(main)
+            if not reduce_phase:
+                # The received payload is one owner's exact BF16 rounding of the
+                # fully reduced FP32 chunk; widening restores it bit-exactly.
+                _device_view(
+                    piece_ptr(recv_chunk, 0), shard_elems, torch.float32, self.device
+                ).copy_(
+                    _device_view(
+                        scratch_wire(rank, k, 0),
+                        shard_elems,
+                        torch.bfloat16,
+                        self.device,
+                    )
+                )
         main.wait_stream(copy_stream)
         main.wait_stream(flag_stream)
         done = steps * pieces
