@@ -162,6 +162,22 @@ def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 
 
+# Diagnostics guard for the BF16 broadcast phase: the phase is used only when the
+# FP32 owner packet is large enough for the halved wire to dominate the extra
+# round trip. The 128-row prefill graph's padded packet (about 3.7 MB) falls below
+# this threshold and stays on the lossless FP32 ring; the 4,608-row hidden
+# (132 MB) and latent (66 MB) packets keep the phase.
+BF16_GATHER_MIN_BYTES = 8 << 20
+
+
+def bf16_gather_eligible(nbytes: int) -> bool:
+    """Whether an FP32 owner packet is large enough for the BF16 broadcast phase."""
+
+    if type(nbytes) is not int or nbytes < 0:
+        raise ValueError("BF16 broadcast eligibility requires a non-negative byte count")
+    return nbytes >= BF16_GATHER_MIN_BYTES
+
+
 def bf16_gather_layout(numel: int, world_size: int, pieces: int) -> tuple[int, int, int]:
     """Validate one packet and return (shard_elems, fp32_piece_bytes, wire_piece_bytes).
 
@@ -529,7 +545,7 @@ class PCIeDmaAllReduce:
                 graph.replay()
                 out.view(-1).copy_(result[:elements])
                 return out
-        if self._bf16_gather:
+        if self._bf16_gather and bf16_gather_eligible(inp.numel() * inp.element_size()):
             return self._run_bf16_gather(inp, out)
         kernels = self._kernels
         world = self.world_size

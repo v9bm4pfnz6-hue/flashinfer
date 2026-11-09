@@ -8,7 +8,8 @@ from __future__ import annotations
 import torch
 import pytest
 
-from b12x.comm.pcie.pcie_dma import bf16_gather_layout
+from b12x.comm.pcie.pcie_dma import (BF16_GATHER_MIN_BYTES, bf16_gather_eligible,
+                                          bf16_gather_layout)
 
 
 def _chain_sum(partials, owner):
@@ -104,3 +105,15 @@ def test_ring_channel_geometry_helpers_are_importable():
     assert _align_up(257, 256) == 512
     assert PCIeDmaAllReduce.__name__ == "PCIeDmaAllReduce"
 
+
+
+def test_bf16_gather_guard_keeps_full_chunk_packets_and_skips_the_128_row_graph():
+    """The diagnostics guard leaves the 128-row padded packet on the FP32 ring."""
+
+    assert BF16_GATHER_MIN_BYTES == 8 << 20
+    assert bf16_gather_eligible(4608 * 7168 * 4)
+    assert bf16_gather_eligible(4608 * 3584 * 4)
+    assert not bf16_gather_eligible(128 * 7168 * 4)
+    assert not bf16_gather_eligible(917_568 * 4)
+    with pytest.raises(ValueError):
+        bf16_gather_eligible(-1)
