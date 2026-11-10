@@ -45,6 +45,8 @@ def query_from_runtime(runtime, *, surface: str, call) -> PcieQuery:
             "a2a_chunks_override": int(runtime._a2a_chunks_override),
             # Present only for a tree channel, so ring queries keep their identity.
             **({"tree": str(runtime.tree)} if getattr(runtime, "tree", None) else {}),
+            # Present only when the first reduce hop carries BF16 values.
+            **({"bf16_first_hop": True} if getattr(runtime, "_bf16_first_hop", False) else {}),
             **dict(call),
         }
     )

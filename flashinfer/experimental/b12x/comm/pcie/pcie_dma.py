@@ -242,6 +242,22 @@ def bf16_gather_layout(numel: int, world_size: int, pieces: int) -> tuple[int, i
     return shard_elems, fp32_piece_bytes, wire_piece_bytes
 
 
+def _add_bf16_into_fp32(
+    destination: int, addend: int, wire: int, numel: int, device: torch.device
+) -> None:
+    """destination = addend + wire: FP32 values plus BF16 values, one FP32 addition per element.
+
+    Widening a BF16 value to FP32 is exact, so the sum is the one the FP32 add
+    kernel forms from the same two values.
+    """
+
+    torch.add(
+        _device_view(addend, numel, torch.float32, device),
+        _device_view(wire, numel, torch.bfloat16, device),
+        out=_device_view(destination, numel, torch.float32, device),
+    )
+
+
 def _device_view(
     address: int, numel: int, dtype: torch.dtype, device: torch.device
 ) -> torch.Tensor:
@@ -273,6 +289,12 @@ class PCIeDmaAllReduce:
     reduce-scatter but rounds each fully reduced owner chunk once to BF16 and
     broadcasts those bits, halving the all-gather wire. Callers that store the
     FP32 result in BF16 receive the identical bits.
+
+    bf16_first_hop=True is the caller's declaration that every FP32 packet it
+    reduces holds BF16-representable values. The first reduce hop, which
+    carries a rank's own input chunk, then travels as those BF16 values and
+    the receiver adds them to its FP32 input: the same two addends and the
+    same FP32 sum as the FP32 hop, with half the bytes on that hop.
     """
 
     def __init__(
@@ -284,6 +306,7 @@ class PCIeDmaAllReduce:
         ext_module=None,
         fp8: Optional[str] = None,
         bf16_gather: bool = False,
+        bf16_first_hop: bool = False,
         tree: Optional[str] = None,
         ipc=None,
     ) -> None:
@@ -430,6 +453,9 @@ class PCIeDmaAllReduce:
             self._bf16_stage = torch.empty(
                 stage_bytes, dtype=torch.uint8, device=self.device
             )
+        if bf16_first_hop and not self._bf16_gather:
+            raise ValueError("a BF16 first hop belongs to the BF16 broadcast ring")
+        self._bf16_first_hop = bool(bf16_first_hop)
         self._tree_stage = None
         if self._tree is not None:
             if self._fp8 or self._bf16_gather:
@@ -532,6 +558,12 @@ class PCIeDmaAllReduce:
         """True when the all-gather phase forwards a single BF16 owner rounding."""
 
         return self._bf16_gather
+
+    @property
+    def bf16_first_hop(self) -> bool:
+        """True when packets are declared BF16-valued and the first reduce hop carries BF16."""
+
+        return self._bf16_first_hop
 
     def prepare_eager_replay(
         self, dtype: torch.dtype, *, max_elements: int | None = None
@@ -978,9 +1010,6 @@ class PCIeDmaAllReduce:
         add_done = self._piece_events
         copied = self._copied_events
         in_base, out_base = inp.data_ptr(), out.data_ptr()
-        self._input_ready.record(main)
-        copy_stream.wait_event(self._input_ready)
-        flag_stream.wait_event(self._input_ready)
 
         def piece_ptr(chunk: int, piece: int) -> int:
             return out_base + chunk * shard_bytes + piece * piece_bytes
@@ -1000,6 +1029,21 @@ class PCIeDmaAllReduce:
         def slot(step: int, piece: int) -> int:
             return step * pieces + piece
 
+        first_hop = self._bf16_first_hop
+        if first_hop:
+            # The packet holds BF16 values: this rank's own chunk leaves as them.
+            for p in range(pieces):
+                _device_view(
+                    stage_piece(p), piece_elems, torch.bfloat16, self.device
+                ).copy_(
+                    _device_view(
+                        in_piece_ptr(rank, p), piece_elems, torch.float32, self.device
+                    )
+                )
+        self._input_ready.record(main)
+        copy_stream.wait_event(self._input_ready)
+        flag_stream.wait_event(self._input_ready)
+
         for k in range(steps):
             reduce_phase = k < world - 1
             if reduce_phase:
@@ -1009,6 +1053,9 @@ class PCIeDmaAllReduce:
                 send_chunk = (rank + 1 - (k - (world - 1))) % world
                 recv_chunk = (rank - (k - (world - 1))) % world
             if k == world - 1:
+                if first_hop:
+                    # The stage fed this rank's first hop; those copies are done first.
+                    main.wait_event(copied[slot(0, pieces - 1)])
                 # The previous reduce step finalized this rank's owned chunk.
                 # Round it once; the first all-gather send waits on the event.
                 for p in range(pieces):
@@ -1024,7 +1071,11 @@ class PCIeDmaAllReduce:
                     )
                 self._ag_ready.record(main)
             for p in range(pieces):
-                if reduce_phase:
+                if first_hop and k == 0:
+                    send_bytes = wire_bytes
+                    send_src = stage_piece(p)
+                    send_dst = scratch_wire(nxt, k, p)
+                elif reduce_phase:
                     send_bytes = piece_bytes
                     send_src = (
                         in_piece_ptr(send_chunk, p)
@@ -1058,7 +1109,17 @@ class PCIeDmaAllReduce:
                     self._counter_ptr(self._wait_counters, slot(k, p)),
                     self._counter_ptr(self._wait_done, slot(k, p)),
                 )
-                if reduce_phase:
+                if first_hop and k == 0:
+                    # The previous rank's own chunk arrived as BF16 values.
+                    kernels.dma_wait_flag(*wait[:2])
+                    _add_bf16_into_fp32(
+                        piece_ptr(recv_chunk, p),
+                        in_piece_ptr(recv_chunk, p),
+                        scratch_wire(rank, k, p),
+                        piece_elems,
+                        self.device,
+                    )
+                elif reduce_phase:
                     kernels.dma_add(
                         piece_ptr(recv_chunk, p),
                         in_piece_ptr(recv_chunk, p),
