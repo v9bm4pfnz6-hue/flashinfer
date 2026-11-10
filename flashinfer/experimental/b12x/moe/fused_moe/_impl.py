@@ -8623,7 +8623,11 @@ def _plan_full_rotation_w4a16_launches(
         stages = caps.decode_config.w4a16_pipeline_stages or measured.get(
             "pipeline_stages"
         )
-        tiles = caps.decode_config.w4a16_tile_config or core_plan.trellis_tile_config
+        tiles = (
+            measured.get("tile_config")
+            or caps.decode_config.w4a16_tile_config
+            or core_plan.trellis_tile_config
+        )
         # The decode table is its own control (auto/compact/full). Note that
         # w4a16_route_mode ("packed"/"direct") selects route PACKING, not the
         # Trellis decode table - do not map one onto the other.
@@ -8692,9 +8696,23 @@ def _plan_full_rotation_w4a16_launches(
         pipeline_stages = int(stages_env) if stages_env else None
 
         def compile_fused(token_count: int, broadcast_suh: bool) -> object:
-            launch_block, launch_stages, launch_tiles, launch_table = _launch_shape(
-                token_count
-            )
+            _, _, _, measured_table = _launch_shape(token_count)
+            try:
+                return _compile_fused(token_count, broadcast_suh, measured_table)
+            except ValueError as exc:
+                # The direct-table prefill geometry ("full1") needs 64 KiB of
+                # shared memory beside the staging of 48-row blocks; a shard
+                # whose stages do not leave that room keeps the plan's table.
+                if measured_table != "full1" or "decode table" not in str(exc):
+                    raise
+                return _compile_fused(
+                    token_count, broadcast_suh, caps.trellis_decode_table
+                )
+
+        def _compile_fused(
+            token_count: int, broadcast_suh: bool, launch_table: str
+        ) -> object:
+            launch_block, launch_stages, launch_tiles, _ = _launch_shape(token_count)
             # B12X_TRELLIS_PIPELINE_STAGES and B12X_TRELLIS_TILE_CONFIG replace
             # the plan's geometry for decode-size launches; launches of 128
             # tokens or more keep the measured prefill shapes and native tiles.
@@ -9520,42 +9538,53 @@ def _prewarm_w4a16_planned_launches(
             # graph-safe and allocation-free at bind/run time.
             broadcast_suh_options = (False, True) if full_rotation else (False,)
             for broadcast_suh in broadcast_suh_options:
-                resolved_fused = compile_w4a16_fused_moe(
-                    size_m=token_count,
-                    hidden_size=workspace.k,
-                    intermediate_size=workspace.n,
-                    num_experts=workspace.weight_E,
-                    top_k=workspace.num_topk,
-                    activation=workspace.activation,
-                    apply_router_weight_on_input=bool(apply_router_weight_on_input),
-                    zero_fc2_output=False,
-                    moe_block_size=block_size_m,
-                    max_m_blocks=max_m_blocks,
-                    element_dtype=element_dtype,
-                    sms=sms,
-                    max_shared_mem=max_shared_mem,
-                    swiglu_limit=swiglu_limit,
-                    swiglu_clamp_after_silu=swiglu_clamp_after_silu,
-                    swiglu_alpha=swiglu_alpha,
-                    swiglu_beta=swiglu_beta,
-                    weight_layout=weight_layout,
-                    scale_format=scale_format,
-                    w13_layout=w13_layout,
-                    prefill_fused_sum_fp32=build_prefill_fused_sum,
-                    collect_activation_amax=collect_activation_amax,
-                    trellis_bits=workspace.trellis_bits,
-                    trellis_codebook=workspace.trellis_codebook or LUT_E4M3,
-                    fc1_trellis_pair_kind=_fc_trellis_pair_kind(workspace),
-                    fc2_trellis_pair_kind=_fc_trellis_pair_kind(workspace),
-                    force_tile_config=workspace.trellis_tile_config,
-                    pipeline_stages=launch_stages,
-                    trellis_decode_table=launch_table,
-                    intermediate_rotation=full_rotation,
-                    full_rotation=full_rotation,
-                    intermediate_hadamard=workspace.intermediate_hadamard,
-                    rotation_input_dtype=input_element_dtype,
-                    broadcast_suh=broadcast_suh,
-                )
+                # The direct-table prefill geometry ("full1") keeps the heuristic table
+                # on a shard whose stages leave no room for the 64 KiB table.
+                for table in (launch_table, "auto") if launch_table == "full1" else (launch_table,):
+                    try:
+                        resolved_fused = compile_w4a16_fused_moe(
+                            size_m=token_count,
+                            hidden_size=workspace.k,
+                            intermediate_size=workspace.n,
+                            num_experts=workspace.weight_E,
+                            top_k=workspace.num_topk,
+                            activation=workspace.activation,
+                            apply_router_weight_on_input=bool(apply_router_weight_on_input),
+                            zero_fc2_output=False,
+                            moe_block_size=block_size_m,
+                            max_m_blocks=max_m_blocks,
+                            element_dtype=element_dtype,
+                            sms=sms,
+                            max_shared_mem=max_shared_mem,
+                            swiglu_limit=swiglu_limit,
+                            swiglu_clamp_after_silu=swiglu_clamp_after_silu,
+                            swiglu_alpha=swiglu_alpha,
+                            swiglu_beta=swiglu_beta,
+                            weight_layout=weight_layout,
+                            scale_format=scale_format,
+                            w13_layout=w13_layout,
+                            prefill_fused_sum_fp32=build_prefill_fused_sum,
+                            collect_activation_amax=collect_activation_amax,
+                            trellis_bits=workspace.trellis_bits,
+                            trellis_codebook=workspace.trellis_codebook or LUT_E4M3,
+                            fc1_trellis_pair_kind=_fc_trellis_pair_kind(workspace),
+                            fc2_trellis_pair_kind=_fc_trellis_pair_kind(workspace),
+                            force_tile_config=(
+                                measured.get("tile_config") or workspace.trellis_tile_config
+                            ),
+                            pipeline_stages=launch_stages,
+                            trellis_decode_table=table,
+                            intermediate_rotation=full_rotation,
+                            full_rotation=full_rotation,
+                            intermediate_hadamard=workspace.intermediate_hadamard,
+                            rotation_input_dtype=input_element_dtype,
+                            broadcast_suh=broadcast_suh,
+                        )
+                    except ValueError as exc:
+                        if table != "full1" or "decode table" not in str(exc):
+                            raise
+                        continue
+                    break
                 if not broadcast_suh:
                     fused_launches[fused_key] = resolved_fused
             t_fused = time.perf_counter() if _B12X_TIMING else 0.0
