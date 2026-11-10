@@ -496,6 +496,15 @@ class W4A16FusedMoeKernel:
         self.extra_grid_barriers = int(
             os.environ.get("B12X_TRELLIS_EXTRA_BARRIERS", "0")
         )
+        # Opt-in: issue every rotation side-table / FC1 load of the input
+        # rotation and of the SiTU + intermediate-Hadamard phase up front so
+        # each warp pays one global round trip instead of one per dependent
+        # step.  Same arithmetic in the same order -> bit-identical output.
+        # Uniform-rate layout only (pair layouts keep the original path).
+        self.prefetch_sides = (
+            os.environ.get("B12X_TRELLIS_PREFETCH_SIDES", "0") == "1"
+            and self.fc1_trellis_pair_kind is None
+        )
         self.trellis_lut_smem_bytes = (
             65536 if self.trellis_direct_lut else _LUT_E4M3_SMEM_REGION_BYTES
         )
@@ -576,6 +585,7 @@ class W4A16FusedMoeKernel:
             self.lut_cp_async,
             self.lut_cp_async_deferred,
             self.extra_grid_barriers,
+            self.prefetch_sides,
             self.small_m_splitk,
             self.fc1.__cache_key__,
             self.fc2.__cache_key__,
@@ -1718,6 +1728,17 @@ class W4A16FusedMoeKernel:
                 x33 = cutlass.Float16(
                     x_input_flat[x_base + Int32(387)].to(cutlass.Float32)
                 ).to(cutlass.Float32)
+                if cutlass.const_expr(self.prefetch_sides):
+                    if cutlass.const_expr(self.broadcast_suh):
+                        ps_base = col0
+                    else:
+                        ps_base = expert * Int32(self.hidden_size) + col0
+                    pre_s = cute.make_rmem_tensor((16,), cutlass.Float32)
+                    for gi in cutlass.range_constexpr(4):
+                        for ri in cutlass.range_constexpr(4):
+                            pre_s[gi * 4 + ri] = suh_flat[
+                                ps_base + Int32(gi * 128 + ri)
+                            ].to(cutlass.Float32)
 
                 h00, h01, h02, h03 = self._had128_quad(x00, x01, x02, x03, lane)
                 h10, h11, h12, h13 = self._had128_quad(x10, x11, x12, x13, lane)
@@ -1746,10 +1767,16 @@ class W4A16FusedMoeKernel:
                         c0, c1, c2, c3 = c20, c21, c22, c23
                     else:
                         c0, c1, c2, c3 = c30, c31, c32, c33
-                    s0 = suh_flat[s_base + offset + Int32(0)].to(cutlass.Float32)
-                    s1 = suh_flat[s_base + offset + Int32(1)].to(cutlass.Float32)
-                    s2 = suh_flat[s_base + offset + Int32(2)].to(cutlass.Float32)
-                    s3 = suh_flat[s_base + offset + Int32(3)].to(cutlass.Float32)
+                    if cutlass.const_expr(self.prefetch_sides):
+                        s0 = pre_s[group * 4 + 0]
+                        s1 = pre_s[group * 4 + 1]
+                        s2 = pre_s[group * 4 + 2]
+                        s3 = pre_s[group * 4 + 3]
+                    else:
+                        s0 = suh_flat[s_base + offset + Int32(0)].to(cutlass.Float32)
+                        s1 = suh_flat[s_base + offset + Int32(1)].to(cutlass.Float32)
+                        s2 = suh_flat[s_base + offset + Int32(2)].to(cutlass.Float32)
+                        s3 = suh_flat[s_base + offset + Int32(3)].to(cutlass.Float32)
                     c0 = cutlass.Float16(c0 * s0).to(cutlass.Float32)
                     c1 = cutlass.Float16(c1 * s1).to(cutlass.Float32)
                     c2 = cutlass.Float16(c2 * s2).to(cutlass.Float32)
@@ -1760,6 +1787,41 @@ class W4A16FusedMoeKernel:
                     a_shared_flat[out_base + offset + Int32(2)] = cutlass.Float16(o2)
                     a_shared_flat[out_base + offset + Int32(3)] = cutlass.Float16(o3)
             unit += gw_stride
+
+    @cute.jit
+    def _pre_quad_offsets(self, row: Int32, expert: Int32, pre_block: Int32, lane: Int32):
+        """Address part of _load_intermediate_hadamard_pre_quad (uniform-rate layout)."""
+        chunk = lane >> Int32(3)
+        chunk_lane = lane & Int32(7)
+        channel_group = pre_block * Int32(2) + (chunk >> Int32(1))
+        slot = chunk & Int32(1)
+        coord = channel_group * Int32(32) + chunk_lane * Int32(4)
+        isz = Int32(self.intermediate_size)
+        fc1_base = row * Int32(2 * self.intermediate_size) + slot * isz + coord
+        rot_base = expert * Int32(6 * self.intermediate_size)
+        scale_base = rot_base + slot * isz + coord
+        sign_base = (
+            rot_base
+            + Int32(3 * self.intermediate_size)
+            + pre_block * Int32(128)
+            + lane * Int32(4)
+        )
+        return fc1_base, scale_base, sign_base
+
+    @cute.jit
+    def _pre_quad_compute(self, pre: cute.Tensor, base: cutlass.Constexpr[int], lane: Int32):
+        """Arithmetic part of _load_intermediate_hadamard_pre_quad, same op order."""
+        h0, h1, h2, h3 = self._had128_quad(pre[base + 0], pre[base + 1], pre[base + 2], pre[base + 3], lane)
+        h0 *= pre[base + 4]
+        h1 *= pre[base + 5]
+        h2 *= pre[base + 6]
+        h3 *= pre[base + 7]
+        h0, h1, h2, h3 = self._had128_quad(h0, h1, h2, h3, lane)
+        h0 *= pre[base + 8]
+        h1 *= pre[base + 9]
+        h2 *= pre[base + 10]
+        h3 *= pre[base + 11]
+        return h0, h1, h2, h3
 
     @cute.jit
     def _load_intermediate_hadamard_pre_quad(
@@ -1867,12 +1929,33 @@ class W4A16FusedMoeKernel:
                 and expert < weight_num_experts
             ):
                 p0 = post_block * Int32(2)
-                a0, a1, a2, a3 = self._load_intermediate_hadamard_pre_quad(
-                    fc1_flat, rotations_flat, row, expert, p0, lane
-                )
-                b0, b1, b2, b3 = self._load_intermediate_hadamard_pre_quad(
-                    fc1_flat, rotations_flat, row, expert, p0 + Int32(1), lane
-                )
+                if cutlass.const_expr(self.prefetch_sides):
+                    isz_p = Int32(self.intermediate_size)
+                    rot_base_p = expert * Int32(6 * self.intermediate_size)
+                    col0_p = post_block * Int32(128) + lane * Int32(4)
+                    pre = cute.make_rmem_tensor((32,), cutlass.Float32)
+                    for half_i in cutlass.range_constexpr(2):
+                        fb, sb, gb = self._pre_quad_offsets(row, expert, p0 + Int32(half_i), lane)
+                        for ri in cutlass.range_constexpr(4):
+                            pre[half_i * 12 + ri] = fc1_flat[fb + Int32(ri)].to(cutlass.Float32)
+                            pre[half_i * 12 + 4 + ri] = rotations_flat[sb + Int32(ri)].to(cutlass.Float32)
+                            pre[half_i * 12 + 8 + ri] = rotations_flat[gb + Int32(ri)].to(cutlass.Float32)
+                    for ri in cutlass.range_constexpr(4):
+                        pre[24 + ri] = rotations_flat[
+                            rot_base_p + Int32(5 * self.intermediate_size) + col0_p + Int32(ri)
+                        ].to(cutlass.Float32)
+                        pre[28 + ri] = rotations_flat[
+                            rot_base_p + Int32(2 * self.intermediate_size) + col0_p + Int32(ri)
+                        ].to(cutlass.Float32)
+                    a0, a1, a2, a3 = self._pre_quad_compute(pre, 0, lane)
+                    b0, b1, b2, b3 = self._pre_quad_compute(pre, 12, lane)
+                else:
+                    a0, a1, a2, a3 = self._load_intermediate_hadamard_pre_quad(
+                        fc1_flat, rotations_flat, row, expert, p0, lane
+                    )
+                    b0, b1, b2, b3 = self._load_intermediate_hadamard_pre_quad(
+                        fc1_flat, rotations_flat, row, expert, p0 + Int32(1), lane
+                    )
                 if cutlass.const_expr(self.activation_is_situ):
                     beta = cutlass.Float32(SITU_DEFAULT_BETA)
                     linear_beta = cutlass.Float32(SITU_DEFAULT_LINEAR_BETA)
@@ -1927,19 +2010,31 @@ class W4A16FusedMoeKernel:
                 isz = Int32(self.intermediate_size)
                 col0 = post_block * Int32(128) + lane * Int32(4)
                 rot_base = expert * Int32(6 * self.intermediate_size)
-                sign_base = rot_base + Int32(5 * self.intermediate_size) + col0
-                v0 *= rotations_flat[sign_base + Int32(0)].to(cutlass.Float32)
-                v1 *= rotations_flat[sign_base + Int32(1)].to(cutlass.Float32)
-                v2 *= rotations_flat[sign_base + Int32(2)].to(cutlass.Float32)
-                v3 *= rotations_flat[sign_base + Int32(3)].to(cutlass.Float32)
-                v0, v1, v2, v3 = self._had128_quad(v0, v1, v2, v3, lane)
+                if cutlass.const_expr(self.prefetch_sides):
+                    v0 *= pre[24]
+                    v1 *= pre[25]
+                    v2 *= pre[26]
+                    v3 *= pre[27]
+                    v0, v1, v2, v3 = self._had128_quad(v0, v1, v2, v3, lane)
+                    v0 *= pre[28]
+                    v1 *= pre[29]
+                    v2 *= pre[30]
+                    v3 *= pre[31]
+                    v0, v1, v2, v3 = self._had128_quad(v0, v1, v2, v3, lane)
+                else:
+                    sign_base = rot_base + Int32(5 * self.intermediate_size) + col0
+                    v0 *= rotations_flat[sign_base + Int32(0)].to(cutlass.Float32)
+                    v1 *= rotations_flat[sign_base + Int32(1)].to(cutlass.Float32)
+                    v2 *= rotations_flat[sign_base + Int32(2)].to(cutlass.Float32)
+                    v3 *= rotations_flat[sign_base + Int32(3)].to(cutlass.Float32)
+                    v0, v1, v2, v3 = self._had128_quad(v0, v1, v2, v3, lane)
 
-                down_base = rot_base + Int32(2 * self.intermediate_size) + col0
-                v0 *= rotations_flat[down_base + Int32(0)].to(cutlass.Float32)
-                v1 *= rotations_flat[down_base + Int32(1)].to(cutlass.Float32)
-                v2 *= rotations_flat[down_base + Int32(2)].to(cutlass.Float32)
-                v3 *= rotations_flat[down_base + Int32(3)].to(cutlass.Float32)
-                v0, v1, v2, v3 = self._had128_quad(v0, v1, v2, v3, lane)
+                    down_base = rot_base + Int32(2 * self.intermediate_size) + col0
+                    v0 *= rotations_flat[down_base + Int32(0)].to(cutlass.Float32)
+                    v1 *= rotations_flat[down_base + Int32(1)].to(cutlass.Float32)
+                    v2 *= rotations_flat[down_base + Int32(2)].to(cutlass.Float32)
+                    v3 *= rotations_flat[down_base + Int32(3)].to(cutlass.Float32)
+                    v0, v1, v2, v3 = self._had128_quad(v0, v1, v2, v3, lane)
                 out_base = row * isz + col0
                 activated_flat[out_base + Int32(0)] = self._cast_elem(v0)
                 activated_flat[out_base + Int32(1)] = self._cast_elem(v1)
