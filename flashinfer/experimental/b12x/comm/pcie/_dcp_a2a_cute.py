@@ -61,6 +61,11 @@ _PREPARED_KIMI_TOPK_LAUNCHERS: set[int] = set()
 # non-posted peer reads) is unchanged when this is unset or "0".
 PAIR_PUSH_ENV = "B12X_PCIE_DCP_PAIR_PUSH"
 PAIR_PUSH_MAX_ROWS = 8
+# A Kimi latent row (3,584 BF16) and router row (896 FP32) in 16-byte packs. A
+# world that does not divide those widths gathers ceil-width shards whose
+# padding is the tail of the last rank's shard; the fused push clips there.
+_KIMI_LATENT_PACKS = 448
+_KIMI_ROUTER_PACKS = 224
 
 
 def pair_push_enabled() -> bool:
@@ -102,6 +107,18 @@ def lse_push_tp8_enabled() -> bool:
     """
 
     return env_flag("PCIE_DCP_LSE_PUSH_TP8", default=False)
+
+
+def lse_push_tp9_enabled() -> bool:
+    """Opt-in push transport for the TP9 LSE reduce-scatter (default: pull).
+
+    ``B12X_PCIE_DCP_LSE_PUSH_TP9=1`` selects the indexed push of TP4/TP8 at
+    world 9: the staging rows a destination reads are indexed by source rank,
+    so the capacity and the accumulation order are those of the pull kernel.
+    Read when the launcher is compiled; identical on every rank.
+    """
+
+    return env_flag("PCIE_DCP_LSE_PUSH_TP9", default=False)
 
 
 @dsl_user_op
@@ -440,7 +457,7 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
         # B12X_PCIE_DCP_LSE_PUSH_TP8 switch (process-constant, read at
         # compile-factory time).  TP4/TP8 index incoming rows by source rank.
         self._push = self._world_size in (2, 4) or (
-            self._world_size == 8 and bool(push_tp8)
+            self._world_size in (8, 9) and bool(push_tp8)
         )
         self._indexed_push = self._push and self._world_size != 2
         # TP8 push issues destinations in XOR order with the cross-island
@@ -450,6 +467,12 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
         if self._push and self._world_size == 8:
             self._destination_order = tuple(
                 self._rank ^ (step ^ 4) for step in range(8)
+            )
+        elif self._push and self._world_size == 9:
+            # TP9 push rotates: at every step each rank writes to a different
+            # destination, so no destination receives from all ranks at once.
+            self._destination_order = tuple(
+                (self._rank + step) % 9 for step in range(9)
             )
         else:
             self._destination_order = tuple(range(self._world_size))
@@ -1807,6 +1830,10 @@ class _AllGatherPairLaunch(_DCPA2ABase):
             # transaction count dominates router-row transfer time.
             router_pack = Int32(tidx)
             router_packs_total = Int32(self._world_size) * second_packs
+            # Padded worlds gather more than 896 logits; the padding follows
+            # the last valid expert in rank-major order.
+            if router_packs_total > Int32(_KIMI_ROUTER_PACKS):
+                router_packs_total = Int32(_KIMI_ROUTER_PACKS)
             while router_pack < router_packs_total:
                 source_rank = router_pack // second_packs
                 pack = router_pack - source_rank * second_packs
@@ -2068,6 +2095,13 @@ class _AllGatherPairLaunch(_DCPA2ABase):
         cute.arch.sync_threads()
 
         row_first = Int32(self._world_size) * first_packs
+        output_row_first = row_first
+        if cutlass.const_expr(self._kimi_topk):
+            # The fused output is the Kimi latent row itself: a padded world's
+            # last shard is clipped at the row's 448 packs.
+            output_row_first = Int32(_KIMI_LATENT_PACKS)
+            if row_first > output_row_first:
+                row_first = output_row_first
         linear = Int32(tidx)
         while linear < row_first:
             source_rank = linear // first_packs
@@ -2093,7 +2127,8 @@ class _AllGatherPairLaunch(_DCPA2ABase):
                 Int64(
                     (
                         output_first
-                        + (Int64(row) * Int64(row_first) + Int64(linear)) * Int64(4)
+                        + (Int64(row) * Int64(output_row_first) + Int64(linear))
+                        * Int64(4)
                     ).toint()
                 ),
             )
@@ -2357,7 +2392,9 @@ def _get_compiled_lse_reduce_scatter(
     device_slot_selection: bool,
 ) -> Callable:
     """Compile and retain one LSE reduce-scatter launcher specialization."""
-    push_tp8 = int(world_size) == 8 and lse_push_tp8_enabled()
+    push_tp8 = (int(world_size) == 8 and lse_push_tp8_enabled()) or (
+        int(world_size) == 9 and lse_push_tp9_enabled()
+    )
     launch = _LseReduceScatterLaunch(
         world_size,
         rank,
@@ -2384,7 +2421,7 @@ def _get_compiled_lse_reduce_scatter(
         # Only the opt-in variant extends the compile identity, so default
         # (pull) TP8 programs keep their existing cache keys.
         key = (*key, "push")
-        labels = (*labels, "tp8_transport")
+        labels = (*labels, "tp9_transport" if int(world_size) == 9 else "tp8_transport")
     raise_if_kernel_resolution_frozen("cute.compile", target=launch, cache_key=key)
     p_u32 = _u32_ptr(16, align=4)
     p_f32 = _f32_ptr(16)
@@ -2980,6 +3017,8 @@ def all_gather_pair_kimi_topk(
     slot_delta_bytes: int,
     launcher: Callable | None = None,
     rows: int = 1,
+    down_packs: int | None = None,
+    router_packs: int | None = None,
 ) -> None:
     slot_delta_256b = _slot_delta_256b(slot_delta_bytes)
     if launcher is None:
@@ -3004,8 +3043,8 @@ def all_gather_pair_kimi_topk(
         staging_ptrs,
         signal_ptrs,
         int(rows),
-        448 // world_size,
-        224 // world_size,
+        _KIMI_LATENT_PACKS // world_size if down_packs is None else int(down_packs),
+        _KIMI_ROUTER_PACKS // world_size if router_packs is None else int(router_packs),
         slot_delta_256b,
     )
 

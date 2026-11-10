@@ -1392,12 +1392,36 @@ class PCIeDCPA2A:
             raise RuntimeError("PCIeDCPA2A is closed")
         down_width, router_width = 3584 // self.world_size, 896 // self.world_size
         rows = 1
+        packs = {}
         if _state_pair_push(state):
             # The push transport runs one CTA per row, so it fuses top-16 for
             # 1..8 rows; the default pull kernel stays single-row.
             rows = int(local_down.shape[0]) if local_down.ndim == 2 else 0
             if rows <= 0 or rows > min(self.max_batch_size, PAIR_PUSH_MAX_ROWS):
                 raise ValueError("Kimi paired gather rows exceed prepared capacity")
+            if 3584 % self.world_size or 896 % self.world_size:
+                # A world that does not divide the Kimi widths gathers ceil-width
+                # shards; the push kernel clips the padded tail of the last one.
+                if local_down.ndim != 2 or local_router.ndim != 2:
+                    raise ValueError("Kimi paired gather shards must be matrices")
+                down_width = int(local_down.shape[1])
+                router_width = int(local_router.shape[1])
+                peers = self.world_size - 1
+                if (
+                    down_width % 8
+                    or router_width % 4
+                    or not peers * down_width < 3584 <= self.world_size * down_width
+                    or not peers * router_width < 896 <= self.world_size * router_width
+                    or 2 * down_width + 4 * router_width != self.query_head_dim
+                ):
+                    raise ValueError(
+                        "padded Kimi paired gather shards must be 16-byte aligned, "
+                        "cover 3,584 latent and 896 router columns with padding in "
+                        "the last shard only, and match the runtime query dimension"
+                    )
+                packs = dict(
+                    down_packs=down_width * 2 // 16, router_packs=router_width * 4 // 16
+                )
         expected = (
             (local_down, (rows, down_width), torch.bfloat16, "local_down"),
             (local_router, (rows, router_width), torch.float32, "local_router"),
@@ -1462,6 +1486,7 @@ class PCIeDCPA2A:
             device_slot_selection=self._device_slot_selection,
             launcher=state.launcher(self._device_slot_selection),
             **({"rows": rows} if rows != 1 else {}),
+            **packs,
         )
         return out_down, topk_weights, topk_ids
 
@@ -1478,6 +1503,8 @@ class PCIeDCPA2A:
         device_slot_selection: bool,
         launcher,
         rows: int = 1,
+        down_packs: int | None = None,
+        router_packs: int | None = None,
     ) -> None:
         from ._dcp_a2a_cute import all_gather_pair_kimi_topk
 
@@ -1497,6 +1524,11 @@ class PCIeDCPA2A:
                 slot_delta_bytes=self._slot_bytes if slot == 0 else -self._slot_bytes,
                 launcher=launcher,
                 **({"rows": rows} if rows != 1 else {}),
+                **(
+                    {}
+                    if down_packs is None
+                    else {"down_packs": down_packs, "router_packs": router_packs}
+                ),
             )
 
     def kimi_topk16(

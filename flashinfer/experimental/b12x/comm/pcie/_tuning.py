@@ -41,6 +41,10 @@ SURFACES = {
     "kimi_topk16": (1,),
 }
 
+# The fused Kimi pair gather needs shards that divide the latent and router rows,
+# except on its push transport, which clips the padded last shard of these worlds.
+PUSHED_KIMI_PAIR_WORLDS = (9,)
+
 
 @dataclass(frozen=True, kw_only=True)
 class PcieQuery:
@@ -68,7 +72,11 @@ def _validate_query(query: PcieQuery, device) -> None:
     worlds = SURFACES.get(query.surface)
     if worlds is None:
         raise ValueError(f"unknown PCIe execution surface {query.surface!r}")
-    if query.world_size not in worlds:
+    if query.world_size not in worlds and not (
+        query.surface.endswith(".all_gather_pair_kimi_topk")
+        and query.world_size in PUSHED_KIMI_PAIR_WORLDS
+        and query.call.get("pair_transport") == "push"
+    ):
         raise ValueError(f"{query.surface} supports world sizes {worlds}")
     if not 0 <= query.rank < query.world_size:
         raise ValueError("rank must belong to the caller's process group")
