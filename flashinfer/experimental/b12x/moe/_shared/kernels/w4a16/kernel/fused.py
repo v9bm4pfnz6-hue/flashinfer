@@ -62,6 +62,7 @@ from b12x.moe._shared.kernels.w4a16.kernel.config import (
     _normalize_scale_format,
     _pack_f32x2_to_bf16x2_rn,
     _resident_cta_shared_bytes,
+    _trellis_launch_switch,
     _w4a16_small_m_splitk_enabled,
 )
 from b12x.moe._shared.kernels.w4a16.kernel.gemm import W4A16GemmKernel
@@ -493,7 +494,7 @@ class W4A16FusedMoeKernel:
         self.fc1.trellis_direct_lut = self.trellis_direct_lut
         self.fc2.trellis_direct_lut = self.trellis_direct_lut
         self.lut_e4m3_smem = compact_smem or self.trellis_direct_lut
-        lut_cp_async_mode = os.environ.get("B12X_TRELLIS_LUT_CP_ASYNC", "0")
+        lut_cp_async_mode = _trellis_launch_switch("B12X_TRELLIS_LUT_CP_ASYNC", size_m)
         self.lut_cp_async = self.lut_e4m3_smem and lut_cp_async_mode in ("1", "2")
         # Mode 2 leaves the table copy in flight through the register-only
         # input rotation and waits immediately before FC1 consumes it.
@@ -507,7 +508,7 @@ class W4A16FusedMoeKernel:
         # step.  Same arithmetic in the same order -> bit-identical output.
         # Uniform-rate layout only (pair layouts keep the original path).
         self.prefetch_sides = (
-            os.environ.get("B12X_TRELLIS_PREFETCH_SIDES", "0") == "1"
+            _trellis_launch_switch("B12X_TRELLIS_PREFETCH_SIDES", size_m) == "1"
             and self.fc1_trellis_pair_kind is None
         )
         self.trellis_lut_smem_bytes = (
@@ -525,7 +526,7 @@ class W4A16FusedMoeKernel:
         # B12X_TRELLIS_INKERNEL_ROUTE_PACK=2: shared-memory histogram packer
         # on all 8 warps of the last CTA, <= 256 live routes (16 rows at
         # top-16, i.e. two K7-verify streams) and <= 1024 experts.
-        route_pack_mode = os.environ.get("B12X_TRELLIS_INKERNEL_ROUTE_PACK", "0")
+        route_pack_mode = _trellis_launch_switch("B12X_TRELLIS_INKERNEL_ROUTE_PACK", size_m)
         self.inkernel_route_pack = (
             route_pack_mode in ("1", "2")
             and self.full_rotation
@@ -576,7 +577,7 @@ class W4A16FusedMoeKernel:
         self.flow_max_blocks = W4A16_FLOW_MAX_BLOCKS
         self.flow_live_blocks = min(W4A16_FLOW_LIVE_BLOCKS, W4A16_FLOW_MAX_BLOCKS)
         self.flow_flags = (
-            os.environ.get("B12X_TRELLIS_FLOW_FLAGS", "0") == "1"
+            _trellis_launch_switch("B12X_TRELLIS_FLOW_FLAGS", size_m) == "1"
             and self.full_rotation
             and self.intermediate_hadamard
             and self.activation_is_gated

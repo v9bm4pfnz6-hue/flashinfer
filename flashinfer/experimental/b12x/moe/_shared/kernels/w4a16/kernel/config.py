@@ -108,6 +108,25 @@ def _w4a16_trellis_decode_splitk(size_m: int) -> bool | None:
     return int(size_m) < 128
 
 
+def _trellis_launch_switch(name: str, size_m: int, default: str = "0") -> str:
+    """Value of one opt-in Trellis launch switch for a kernel of ``size_m`` tokens.
+
+    ``B12X_TRELLIS_SWITCH_SCOPE=decode`` applies the switches read through this
+    function (LUT_CP_ASYNC, PREFETCH_SIDES, INKERNEL_ROUTE_PACK, FLOW_FLAGS) to
+    launches of fewer than 128 tokens only, the boundary the measured prefill
+    launch shapes and the decode split-K schedule use; a larger launch reads
+    the default and compiles the kernel it compiled without the switches.
+    Unset, the switches apply to every launch.
+    """
+
+    scope = os.environ.get("B12X_TRELLIS_SWITCH_SCOPE", "")
+    if scope not in ("", "decode"):
+        raise ValueError("B12X_TRELLIS_SWITCH_SCOPE must be unset or decode")
+    if scope == "decode" and int(size_m) >= 128:
+        return default
+    return os.environ.get(name, default)
+
+
 def _lut_e4m3_smem_enabled() -> bool:
     """Stage the 4 KiB ``lut_e4m3`` value table once per fused CTA.
 
