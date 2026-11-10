@@ -16,6 +16,7 @@ from b12x._lib.intrinsics.atomics import atomic_add_global_i32
 from b12x._lib.quant.block_codec import block_codec
 from b12x._lib.intrinsics.memory import cp_async4_shared_global
 import cuda.bindings.driver as cuda
+import os
 import cutlass.cute as cute
 import cutlass
 from b12x._lib.intrinsics.math import fabs_f32
@@ -487,6 +488,14 @@ class W4A16FusedMoeKernel:
         self.fc1.trellis_direct_lut = self.trellis_direct_lut
         self.fc2.trellis_direct_lut = self.trellis_direct_lut
         self.lut_e4m3_smem = compact_smem or self.trellis_direct_lut
+        lut_cp_async_mode = os.environ.get("B12X_TRELLIS_LUT_CP_ASYNC", "0")
+        self.lut_cp_async = self.lut_e4m3_smem and lut_cp_async_mode in ("1", "2")
+        # Mode 2 leaves the table copy in flight through the register-only
+        # input rotation and waits immediately before FC1 consumes it.
+        self.lut_cp_async_deferred = self.lut_cp_async and lut_cp_async_mode == "2"
+        self.extra_grid_barriers = int(
+            os.environ.get("B12X_TRELLIS_EXTRA_BARRIERS", "0")
+        )
         self.trellis_lut_smem_bytes = (
             65536 if self.trellis_direct_lut else _LUT_E4M3_SMEM_REGION_BYTES
         )
@@ -564,6 +573,9 @@ class W4A16FusedMoeKernel:
             self.rotation_input_dtype,
             self.lut_e4m3_smem,
             self.trellis_direct_lut,
+            self.lut_cp_async,
+            self.lut_cp_async_deferred,
+            self.extra_grid_barriers,
             self.small_m_splitk,
             self.fc1.__cache_key__,
             self.fc2.__cache_key__,
@@ -985,7 +997,23 @@ class W4A16FusedMoeKernel:
             table_addr = Int64(smem_base + Int32(self.iq2_xs_lut_off))
             fc1_phase_lut_addr = table_addr
             fc2_phase_lut_addr = table_addr
-        if cutlass.const_expr(self.lut_e4m3_smem):
+        if cutlass.const_expr(self.lut_e4m3_smem and self.lut_cp_async):
+            # Issue every 16-byte chunk of the table before waiting once, so
+            # the L2 round trips overlap instead of serializing per iteration.
+            for i in cutlass.range_constexpr(
+                _covering_count(self.trellis_lut_smem_bytes // 16, self.cta_threads)
+            ):
+                chunk = Int32(i * self.cta_threads) + tid
+                if chunk < Int32(self.trellis_lut_smem_bytes // 16):
+                    cp_async4_shared_global(
+                        smem_base + Int32(self.lut_e4m3_smem_off) + chunk * Int32(16),
+                        fc1_trellis_lut_addr + Int64(chunk) * Int64(16),
+                    )
+            cute.arch.cp_async_commit_group()
+            if cutlass.const_expr(not self.lut_cp_async_deferred):
+                cute.arch.cp_async_wait_group(0)
+                cute.arch.sync_threads()
+        elif cutlass.const_expr(self.lut_e4m3_smem):
             self._lut_smem_copy(
                 fc1_trellis_lut_addr,
                 smem_base + Int32(self.lut_e4m3_smem_off),
@@ -993,6 +1021,9 @@ class W4A16FusedMoeKernel:
                 tid,
             )
             cute.arch.sync_threads()
+        if cutlass.const_expr(self.lut_e4m3_smem):
+            # The cp.async staging branch must also hand the shared table
+            # offset to the expert-map emit hooks.
             table_addr = Int64(smem_base + Int32(self.lut_e4m3_smem_off))
             fc1_phase_lut_addr = table_addr
             fc2_phase_lut_addr = table_addr
@@ -1212,6 +1243,11 @@ class W4A16FusedMoeKernel:
                         fc2_bf16_flat[zidx] = zzero
                         zidx += zstride
 
+        if cutlass.const_expr(self.lut_cp_async_deferred):
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.sync_threads()
+        for _ in cutlass.range_constexpr(self.extra_grid_barriers):
+            self._grid_barrier(locks_i32_flat, tid, grid_x)
         if cutlass.const_expr(self.activation_is_gated):
             self.fc1._run_persistent_gemm(
                 a_bf16_flat,

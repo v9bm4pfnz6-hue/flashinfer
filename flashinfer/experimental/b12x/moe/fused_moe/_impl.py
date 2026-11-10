@@ -8663,10 +8663,32 @@ def _plan_full_rotation_w4a16_launches(
             else (capacity_tokens,)
         )
 
+        # Bench-only small-M tuning knobs (plan-time, full-rotation Trellis
+        # only): B12X_TRELLIS_TILE_CONFIG="fc1_k,fc1_n,fc2_k,fc2_n" and
+        # B12X_TRELLIS_PIPELINE_STAGES=2..5 replace the weight plan's fixed
+        # launch geometry. Native t256 storage is tile-independent, so any
+        # tile that divides the projections reads the same bytes.
+        tile_env = os.environ.get("B12X_TRELLIS_TILE_CONFIG", "")
+        tile_config = (
+            tuple(int(v) for v in tile_env.split(","))
+            if tile_env
+            else core_plan.trellis_tile_config
+        )
+        stages_env = os.environ.get("B12X_TRELLIS_PIPELINE_STAGES", "")
+        pipeline_stages = int(stages_env) if stages_env else None
+
         def compile_fused(token_count: int, broadcast_suh: bool) -> object:
             launch_block, launch_stages, launch_tiles, launch_table = _launch_shape(
                 token_count
             )
+            # B12X_TRELLIS_PIPELINE_STAGES and B12X_TRELLIS_TILE_CONFIG replace
+            # the plan's geometry for decode-size launches; launches of 128
+            # tokens or more keep the measured prefill shapes and native tiles.
+            if token_count < 128:
+                if pipeline_stages is not None:
+                    launch_stages = pipeline_stages
+                if tile_env:
+                    launch_tiles = tile_config
             return compile_w4a16_fused_moe(
                 size_m=token_count,
                 hidden_size=core_plan.k,

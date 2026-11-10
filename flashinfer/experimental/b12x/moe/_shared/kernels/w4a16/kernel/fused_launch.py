@@ -22,6 +22,8 @@ from b12x.moe._shared.kernels.activations import normalize_moe_activation
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.program_cache import register_program_cache
 from dataclasses import replace
+import os
+
 import torch
 from b12x.moe._shared.kernels.w4a16.host import validate_activation
 from b12x.moe._shared.kernels.w4a16.kernel.buffers import _rot_scales_dummy
@@ -1166,6 +1168,11 @@ def _w4a16_fused_persistent_grid_x(
     where the host cannot know route_blocks ahead of the launch.
     """
     cap = int(sms) * int(fused.blocks_per_sm)
+    grid_env = os.environ.get("B12X_TRELLIS_GRID_X", "")
+    if grid_env and fused.weight_layout == "trellis_t256":
+        # Bench-only: fewer persistent CTAs (<= the co-residency cap, so the
+        # cooperative barrier stays deadlock-free).
+        cap = max(1, min(cap, int(grid_env)))
     small_m_splitk = getattr(fused, "small_m_splitk", None)
     if small_m_splitk is None:
         small_m_splitk = _w4a16_small_m_splitk_enabled()
