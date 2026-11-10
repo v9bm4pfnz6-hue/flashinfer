@@ -242,22 +242,6 @@ def bf16_gather_layout(numel: int, world_size: int, pieces: int) -> tuple[int, i
     return shard_elems, fp32_piece_bytes, wire_piece_bytes
 
 
-def _add_bf16_into_fp32(
-    destination: int, addend: int, wire: int, numel: int, device: torch.device
-) -> None:
-    """destination = addend + wire: FP32 values plus BF16 values, one FP32 addition per element.
-
-    Widening a BF16 value to FP32 is exact, so the sum is the one the FP32 add
-    kernel forms from the same two values.
-    """
-
-    torch.add(
-        _device_view(addend, numel, torch.float32, device),
-        _device_view(wire, numel, torch.bfloat16, device),
-        out=_device_view(destination, numel, torch.float32, device),
-    )
-
-
 def _device_view(
     address: int, numel: int, dtype: torch.dtype, device: torch.device
 ) -> torch.Tensor:
@@ -293,8 +277,9 @@ class PCIeDmaAllReduce:
     bf16_first_hop=True is the caller's declaration that every FP32 packet it
     reduces holds BF16-representable values. The first reduce hop, which
     carries a rank's own input chunk, then travels as those BF16 values and
-    the receiver adds them to its FP32 input: the same two addends and the
-    same FP32 sum as the FP32 hop, with half the bytes on that hop.
+    the receiver adds them to its FP32 input with the tree channel's
+    accumulate kernel: the same two addends and the same FP32 sum as the
+    FP32 hop, with half the bytes on that hop.
     """
 
     def __init__(
@@ -1112,12 +1097,12 @@ class PCIeDmaAllReduce:
                 if first_hop and k == 0:
                     # The previous rank's own chunk arrived as BF16 values.
                     kernels.dma_wait_flag(*wait[:2])
-                    _add_bf16_into_fp32(
+                    kernels.dma_tree_accum(
                         piece_ptr(recv_chunk, p),
-                        in_piece_ptr(recv_chunk, p),
-                        scratch_wire(rank, k, p),
+                        [scratch_wire(rank, k, p)],
+                        [in_piece_ptr(recv_chunk, p)],
                         piece_elems,
-                        self.device,
+                        False,
                     )
                 elif reduce_phase:
                     kernels.dma_add(
@@ -1564,6 +1549,13 @@ class PCIeDmaAllReduce:
                         self._counter_ptr(self._wait_counters, slot),
                         self._counter_ptr(self._wait_done, slot),
                     ),
+                )
+            if self._bf16_first_hop:
+                # The first reduce hop adds BF16 values to FP32 input with the accumulate
+                # kernel; its first call must not follow a wait on this device.
+                stage = self._bf16_stage.data_ptr()
+                self._kernels.dma_tree_accum(
+                    stage, [stage + 64], [stage + 128], 8, False
                 )
             if self._fp8:
                 if self._fp8_stage is None or self._fp8_stage.numel() < 512:

@@ -182,6 +182,12 @@ def gather_query_from_metadata(
     )
 
 
+def accumulate_variants(call, tree=()) -> tuple:
+    """Accumulate kernels of a channel: a tree's schedule variants, and for a ring whose first
+    reduce hop carries BF16 the sum of one BF16 piece and one FP32 partial stored as FP32."""
+    return tuple(tree) + (((1, 1, False),) if call.get("bf16_first_hop") else ())
+
+
 @program_cache(scope="preparation")
 def compile_dma_surface(query_payload, ordinal: int) -> DmaLaunchers:
     """Compiler-pool factory using only query metadata and native factories."""
@@ -198,6 +204,7 @@ def compile_dma_surface(query_payload, ordinal: int) -> DmaLaunchers:
         variants = tuple(
             sorted({variant for pieces in (1, 2, 4) for variant in schedule(routing, pieces).variants})
         )
+    variants = accumulate_variants(values, variants)
     with torch.cuda.device(int(ordinal)):
         return compile_launchers(
             world_size=query.world_size,
@@ -233,6 +240,12 @@ class _DmaExecutionState:
 
     def release_gather(self) -> None:
         self.runtime._release_gather()
+
+    def prime_gather(self, slots) -> None:
+        """Load the channel's kernels before the first gather waits on a flag, then gather once."""
+        self.runtime._prime_prepared(self)
+        self.run_gather(slots)
+        self.release_gather()
 
     def prime(self, inp, *, out) -> None:
         """Prime the actual caller-owned collective transport after loading code."""

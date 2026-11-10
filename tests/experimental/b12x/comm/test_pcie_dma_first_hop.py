@@ -94,12 +94,7 @@ def _run(monkeypatch, first_hop, pieces, in_place, seed, shard_elems=64, rounds=
             made.address, made.elems, made.dtype = address, elems, dtype
             return made
 
-        def add_wire(destination, addend, wire, elems, device, machine=machine):
-            machine.emit("host", lambda: space.f32(destination, elems).copy_(
-                space.f32(addend, elems) + space.bf16(wire, elems).float()))
-
         monkeypatch.setattr(pcie_dma, "_device_view", view)
-        monkeypatch.setattr(pcie_dma, "_add_bf16_into_fp32", add_wire)
         monkeypatch.setattr(pcie_dma.torch.cuda, "current_stream", lambda device=None, machine=machine: machine.main)
         monkeypatch.setattr(pcie_dma.torch.cuda, "stream", machine.stream)
         for index in range(rounds):
@@ -182,3 +177,61 @@ def test_bf16_first_hop_belongs_to_the_bf16_broadcast_ring():
     first = query_from_runtime(SimpleNamespace(**base, _bf16_first_hop=True), surface="DmaAllReduce.all_reduce", call={})
     # The declaration is part of the plan's identity only when it is made.
     assert "bf16_first_hop" not in plain.call and first.call["bf16_first_hop"] is True
+    # Its plans compile the accumulate of one BF16 piece and one FP32 partial into FP32.
+    from b12x.comm.pcie._dma_preparation import accumulate_variants
+
+    assert accumulate_variants(plain.call) == () and accumulate_variants(first.call) == ((1, 1, False),)
+    assert accumulate_variants(first.call, ((2, 0, True),)) == ((2, 0, True), (1, 1, False))
+
+
+def test_first_hop_accumulate_is_primed_with_the_channel_kernels(monkeypatch):
+    """Priming calls every kernel of the channel on private storage; the accumulate only when declared."""
+    from b12x.comm.pcie import pcie_dma
+
+    calls = []
+
+    class Kernels:
+        def install(self, launchers):
+            calls.append(("install", ()))
+
+        def __getattr__(self, name):
+            return lambda *args, **kwargs: calls.append((name, args[:5]))
+
+    class State:
+        launchers = object()
+
+        def require_runtime(self, runtime):
+            pass
+
+    class Device:
+        def __init__(self, device):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class Stream:
+        def synchronize(self):
+            calls.append(("synchronize", ()))
+
+    monkeypatch.setattr(pcie_dma.torch.cuda, "device", Device)
+    monkeypatch.setattr(pcie_dma.torch.cuda, "current_stream", lambda device=None: Stream())
+    runtime = pcie_dma.PCIeDmaAllReduce.__new__(pcie_dma.PCIeDmaAllReduce)
+    runtime.world_size, runtime.rank, runtime.device = WORLD, 0, torch.device("cpu")
+    runtime._kernels, runtime._fp8 = Kernels(), ""
+    runtime._bf16_stage = torch.zeros(256, dtype=torch.uint8)
+    runtime._flags_base = [1 << 20] * WORLD
+    for name in ("_send_counters", "_wait_counters", "_wait_done"):
+        setattr(runtime, name, torch.zeros(pcie_dma.FLAG_SLOTS, dtype=torch.int32))
+    stage = runtime._bf16_stage.data_ptr()
+    accumulate = ("dma_tree_accum", (stage, [stage + 64], [stage + 128], 8, False))
+    for declared in (True, False):
+        calls.clear()
+        runtime._bf16_first_hop = declared
+        runtime._prime_prepared(State())
+        names = [name for name, _ in calls]
+        assert names[0] == "install" and {"dma_set_flag", "dma_wait_flag", "dma_copy", "dma_add"} <= set(names)
+        assert (accumulate in calls) is declared
