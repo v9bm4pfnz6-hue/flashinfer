@@ -66,6 +66,12 @@ PAIR_PUSH_MAX_ROWS = 8
 # padding is the tail of the last rank's shard; the fused push clips there.
 _KIMI_LATENT_PACKS = 448
 _KIMI_ROUTER_PACKS = 224
+# Worlds whose deployments select experts with kimi_topk16 after an unfused exchange. The fused
+# exchange keeps that kernel's arithmetic there (sigmoid through exp, left-to-right weight sum,
+# unit denominator for an empty sum), so that moving the selection into the exchange changes no
+# bit. Other worlds keep the arithmetic of the native kernel the fused exchange was derived from
+# (sigmoid through tanh, weight sum folded by halves).
+_KIMI_TOPK16_ARITHMETIC_WORLDS = (9,)
 
 
 def pair_push_enabled() -> bool:
@@ -2084,13 +2090,31 @@ class _AllGatherPairLaunch(_DCPA2ABase):
                 bias = cute.arch.load(correction_bias + Int64(expert), Float32)
                 unbiased = Float32(0.0)
                 selection = Float32(float("-inf"))
-                if cute.math.isfinite(router_value) and cute.math.isfinite(bias):
-                    unbiased = Float32(0.5) * cute.math.tanh(
-                        Float32(0.5) * router_value, fastmath=False
-                    ) + Float32(0.5)
+                if cutlass.const_expr(
+                    self._world_size in _KIMI_TOPK16_ARITHMETIC_WORLDS
+                ):
+                    # Statement for statement the scores of _KimiTopK16Launch.
+                    unbiased = Float32(1.0) / (
+                        Float32(1.0) + cute.math.exp(-router_value, fastmath=True)
+                    )
+                    if not cute.math.isfinite(unbiased):
+                        unbiased = Float32(0.0)
                     selection = unbiased + bias
+                    if not cute.math.isfinite(selection):
+                        if selection > Float32(0.0):
+                            selection = Float32(float("inf"))
+                        else:
+                            selection = Float32(float("-inf"))
                     if selection == Float32(0.0):
                         selection = Float32(0.0)
+                else:
+                    if cute.math.isfinite(router_value) and cute.math.isfinite(bias):
+                        unbiased = Float32(0.5) * cute.math.tanh(
+                            Float32(0.5) * router_value, fastmath=False
+                        ) + Float32(0.5)
+                        selection = unbiased + bias
+                        if selection == Float32(0.0):
+                            selection = Float32(0.0)
                 selection_scores[expert] = selection
                 unbiased_scores[expert] = unbiased
                 expert += Int32(self._threads)
@@ -2169,15 +2193,30 @@ class _AllGatherPairLaunch(_DCPA2ABase):
                 # which folds by halves (lane l adds lane l+stride, stride
                 # halving from 16). Summing left to right instead lands a ULP
                 # away, so fold in the same order. Same fifteen adds.
-                eight = [
-                    selected_weights[item] + selected_weights[item + 8]
-                    for item in range(8)
-                ]
-                four = [eight[item] + eight[item + 4] for item in range(4)]
-                two = [four[item] + four[item + 2] for item in range(2)]
-                weight_sum = two[0] + two[1]
+                if cutlass.const_expr(
+                    self._world_size in _KIMI_TOPK16_ARITHMETIC_WORLDS
+                ):
+                    for item in cutlass.range_constexpr(16):
+                        weight_sum += selected_weights[item]
+                else:
+                    eight = [
+                        selected_weights[item] + selected_weights[item + 8]
+                        for item in range(8)
+                    ]
+                    four = [eight[item] + eight[item + 4] for item in range(4)]
+                    two = [four[item] + four[item + 2] for item in range(2)]
+                    weight_sum = two[0] + two[1]
             if Int32(tidx) == Int32(0):
-                scale = Float32(1.0) / (weight_sum + Float32(1.0e-20))
+                scale = Float32(1.0)
+                if cutlass.const_expr(
+                    self._world_size in _KIMI_TOPK16_ARITHMETIC_WORLDS
+                ):
+                    denominator = Float32(1.0)
+                    if weight_sum > Float32(0.0):
+                        denominator = weight_sum
+                    scale = Float32(1.0) / denominator
+                else:
+                    scale = Float32(1.0) / (weight_sum + Float32(1.0e-20))
                 row_out = Int64(0)
                 if cutlass.const_expr(self._push):
                     row_out = Int64(push_row) * Int64(16)
