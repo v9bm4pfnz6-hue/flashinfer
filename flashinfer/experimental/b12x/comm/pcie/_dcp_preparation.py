@@ -116,6 +116,11 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
             lse_stride=tuple(lse.stride()),
             natural_log=bool(call.get("is_lse_base_on_e", True)),
         )
+        from ._dcp_a2a_cute import lse_quad_tp9_enabled
+
+        # Only present when on, so pushed reduce-scatter queries keep their identity.
+        if int(runtime.world_size) == 9 and lse_quad_tp9_enabled():
+            metadata["lse_transport"] = "quad"
     elif surface.endswith("all_gather_heads"):
         value = _call_value(call, "local_input")
         out = call.get("out")
@@ -213,6 +218,7 @@ def compile_dcp_surface(query_payload, ordinal):
                     call["dtype"],
                     int(call["threads"]),
                     slot,
+                    call.get("lse_transport") == "quad",
                 )
                 for slot in (False, True)
             }

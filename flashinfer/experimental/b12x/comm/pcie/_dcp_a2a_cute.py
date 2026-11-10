@@ -18,7 +18,13 @@ from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x._lib.compile_plan import attach_programs
 from b12x._lib.program_cache import program_cache
 from b12x._lib.intrinsics.math import fmax_f32
-from b12x._lib.intrinsics.memory import ld_global_v4_u32, st_global_v4_u32, u32_as_f32
+from b12x._lib.intrinsics.memory import (
+    ld_global_v4_f32,
+    ld_global_v4_u32,
+    st_global_v4_f32,
+    st_global_v4_u32,
+    u32_as_f32,
+)
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils.device import current_cuda_stream
 from b12x._lib.utils.pointers import make_ptr
@@ -221,6 +227,77 @@ def lse_push_tp9_enabled() -> bool:
     """
 
     return env_flag("PCIE_DCP_LSE_PUSH_TP9", default=False)
+
+
+def lse_quad_tp9_enabled() -> bool:
+    """Read the quad-partial switch of the TP9 LSE reduce-scatter (plan time).
+
+    ``B12X_PCIE_DCP_LSE_PUSH_TP9=2`` keeps the push transport and sends the partials of a
+    quad of ranks for a rank of the other quad as one FP32 partial (``lse_quad_roles``).
+    """
+    return os.environ.get("B12X_PCIE_DCP_LSE_PUSH_TP9", "").strip() == "2"
+
+
+def lse_quad_roles(rank: int) -> dict:
+    """Roles of one rank in the nine-rank quad-partial LSE reduce-scatter.
+
+    Topology contract: ranks 0-3 and ranks 4-7 are two quads on the two sides of a single
+    link, and rank 8 sits with ranks 0-3. In the plain push every rank writes its partial
+    rows for a destination's heads into that destination's staging, so the rows of 20
+    (source, destination) pairs cross the link in each direction. Here rank r < 8 combines,
+    for the rank across (r ^ 4), the four partials of its own quad into one LSE-weighted FP32
+    partial with its combined LSE: twice the bytes of one row cross per destination instead
+    of four rows. Rank 8 exchanges rows with every rank directly, as before.
+
+    A staging holds nine groups of rows, one per source rank. At rank r < 8 they hold the
+    rows of its three quad peers and of rank 8 for its own heads (the groups of those ranks),
+    the FP32 partial for its own heads in the two groups of the pair that contains r ^ 4
+    (its LSE in the first), and the rows of its quad peers for the heads of r ^ 4: group r
+    for peer r ^ 1, group r ^ 6 for peer r ^ 2 and group r ^ 7 for peer r ^ 3.
+
+    Returns ``first`` and ``second``, the ``(destination, head_owner, group)`` of the rows
+    this rank pushes before its first and its second barrier, with the barrier masks
+    ``first_mask`` and ``second_mask`` (symmetric relations); ``across`` and ``duty``, the
+    groups of its own staging it combines with its own rows for the heads of ``across``
+    (None and () for rank 8); ``partial``, the two groups of the staging of ``across`` that
+    take the FP32 partial; and ``terms``, the sources of the final combination of its own
+    heads in order: ``("own",)``, ``("rows", group)`` and ``("partial", group, group)``.
+    """
+    if not 0 <= rank < 9:
+        raise ValueError("the quad-partial reduce-scatter is defined for ranks 0 to 8")
+    if rank == 8:
+        return dict(
+            first=tuple((peer, peer, 8) for peer in range(8)),
+            first_mask=0xFF,
+            second=(),
+            second_mask=0,
+            across=None,
+            duty=(),
+            partial=None,
+            terms=(("own",), *(("rows", source) for source in range(8))),
+        )
+    peers = (rank ^ 1, rank ^ 2, rank ^ 3)
+    across = rank ^ 4
+
+    def duty_group(combiner: int, source: int) -> int:
+        return {1: combiner, 2: combiner ^ 6, 3: combiner ^ 7}[combiner ^ source]
+
+    mask = sum(1 << peer for peer in peers)
+    rows = sorted((*peers, 8), key=lambda source: (source - rank) % 9)
+    return dict(
+        first=(*((peer, peer ^ 4, duty_group(peer, rank)) for peer in peers), (8, 8, rank)),
+        first_mask=mask | 1 << 8,
+        second=tuple((peer, peer, rank) for peer in peers),
+        second_mask=mask | 1 << across,
+        across=across,
+        duty=tuple(duty_group(rank, peer) for peer in peers),
+        partial=(rank & ~1, rank | 1),
+        terms=(
+            ("own",),
+            *(("rows", source) for source in rows),
+            ("partial", across & ~1, across | 1),
+        ),
+    )
 
 
 @dsl_user_op
@@ -991,6 +1068,498 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
                             accum[pair * 2 + 1] = _fma_rn_f32(
                                 normalized_weight, hi, accum[pair * 2 + 1]
                             )
+                result0 = self._pack_pair(accum[0], accum[1])
+                result1 = self._pack_pair(accum[2], accum[3])
+                result2 = self._pack_pair(accum[4], accum[5])
+                result3 = self._pack_pair(accum[6], accum[7])
+                st_global_v4_u32(
+                    (output + output_base * Int64(4) + Int64(pack) * Int64(4)).toint(),
+                    result0,
+                    result1,
+                    result2,
+                    result3,
+                )
+            row += warp_stride
+
+        if cutlass.const_expr(self._device_slot_selection):
+            if Int32(tidx) == Int32(0):
+                self_signal = signals[self._rank]
+                _a2a_graph_epoch_arrive(
+                    (self_signal + Int64(_GRAPH_EPOCH_INDEX)).toint(),
+                    (self_signal + Int64(_GRAPH_ARRIVED_INDEX)).toint(),
+                    Uint32(gdim),
+                )
+
+
+class _LseQuadReduceScatterLaunch(_LseReduceScatterLaunch):
+    """Nine-rank LSE reduce-scatter with one FP32 partial per destination between the quads.
+
+    Same staging, launch geometry and row-to-warp mapping as the pushed reduce-scatter
+    (``lse_quad_roles``). The combination of a head is the same weighted mean; the rows of
+    the other quad enter it as one partial that was weighted and summed in FP32 by the rank
+    across, so FP32 products and sums group differently and a BF16 result can differ in its
+    last place from the pushed reduce-scatter's.
+    """
+
+    def __init__(
+        self,
+        world_size: int,
+        rank: int,
+        dtype_name: str,
+        threads: int,
+        device_slot_selection: bool,
+    ) -> None:
+        if int(world_size) != 9:
+            raise ValueError("the quad-partial LSE reduce-scatter is defined for nine ranks")
+        super().__init__(world_size, rank, dtype_name, threads, device_slot_selection, True)
+        self._roles = lse_quad_roles(self._rank)
+
+    @cute.jit
+    def _quad_barrier(self, signals, lane_mask: int):
+        """Per-CTA barrier with the peers of ``lane_mask``, then visibility of their rows."""
+        tidx, _, _ = cute.arch.thread_idx()
+        block_pair_barrier(
+            signals,
+            self_signal=signals[self._rank],
+            rank=self._rank,
+            world_size=self._world_size,
+            max_blocks=_MAX_BLOCKS,
+            lane_mask=lane_mask,
+        )
+        if Int32(tidx) == Int32(0):
+            _membar_sys()
+        cute.arch.sync_threads()
+
+    @cute.jit
+    def _push_rows(
+        self,
+        pushes,
+        local_output,
+        local_lse,
+        staging,
+        slot_offset,
+        lse_offset,
+        batch_index,
+        local_head,
+        total_heads,
+        heads_per_rank,
+        packs_per_head,
+        input_stride_batch,
+        input_stride_head,
+        lane,
+    ):
+        """Write this warp's row of every ``(destination, head_owner, group)`` with its LSE."""
+        for index in cutlass.range_constexpr(len(pushes)):
+            destination = pushes[index][0]
+            head_owner = pushes[index][1]
+            group = pushes[index][2]
+            source_row = (
+                Int64(batch_index) * Int64(total_heads)
+                + Int64(head_owner) * Int64(heads_per_rank)
+                + Int64(local_head)
+            )
+            input_base = (
+                Int64(batch_index) * input_stride_batch
+                + (Int64(head_owner) * Int64(heads_per_rank) + Int64(local_head))
+                * input_stride_head
+            )
+            staged_row = (
+                Int64(batch_index) * Int64(total_heads)
+                + Int64(group) * Int64(heads_per_rank)
+                + Int64(local_head)
+            )
+            destination_staging = staging[destination] + slot_offset
+            stage_words = self._staging_words(destination_staging)
+            stage_lse = self._staging_lse(destination_staging, lse_offset)
+            staging_base = staged_row * Int64(packs_per_head)
+            pack = lane
+            while pack < packs_per_head:
+                _copy_16b(
+                    local_output + input_base * Int64(4) + Int64(pack) * Int64(4),
+                    stage_words + staging_base * Int64(4) + Int64(pack) * Int64(4),
+                )
+                pack += Int32(32)
+            if lane == Int32(0):
+                value = cute.arch.load(local_lse + source_row, Float32)
+                cute.arch.store(stage_lse + staged_row, value)
+
+    @cute.jit
+    def _lse_weights(self, weights, count: int, lane_lse, natural_log):
+        """Turn the LSEs that lanes 0 to count - 1 hold into weights; return their maximum and sum.
+
+        The statements of the pushed reduce-scatter: non-finite LSEs weigh zero, the others
+        exp(LSE - maximum), with the exponential the caller's log base selects.
+        """
+        max_lse = Float32(float("-inf"))
+        for index in cutlass.range_constexpr(count):
+            value = cute.arch.shuffle_sync(lane_lse, offset=index)
+            weights[index] = value
+            max_lse = fmax_f32(max_lse, value)
+        if not cute.math.isfinite(max_lse):
+            max_lse = Float32(0.0)
+        weight_sum = Float32(0.0)
+        if natural_log != Int32(0):
+            for index in cutlass.range_constexpr(count):
+                value = weights[index]
+                delta = value - max_lse
+                weight = Float32(0.0)
+                if cute.math.isfinite(value):
+                    weight = cute.math.exp(delta, fastmath=False)
+                weights[index] = weight
+                weight_sum += weight
+        else:
+            for index in cutlass.range_constexpr(count):
+                value = weights[index]
+                delta = value - max_lse
+                weight = Float32(0.0)
+                if cute.math.isfinite(value):
+                    weight = cute.math.exp2(delta, approx=True)
+                weights[index] = weight
+                weight_sum += weight
+        return max_lse, weight_sum
+
+    @cute.kernel
+    def kernel(
+        self,
+        local_output: cute.Pointer,
+        local_lse: cute.Pointer,
+        output: cute.Pointer,
+        staging0: cute.Pointer,
+        staging1: cute.Pointer,
+        staging2: cute.Pointer,
+        staging3: cute.Pointer,
+        staging4: cute.Pointer,
+        staging5: cute.Pointer,
+        staging6: cute.Pointer,
+        staging7: cute.Pointer,
+        staging8: cute.Pointer,
+        staging9: cute.Pointer,
+        staging10: cute.Pointer,
+        staging11: cute.Pointer,
+        staging12: cute.Pointer,
+        staging13: cute.Pointer,
+        staging14: cute.Pointer,
+        staging15: cute.Pointer,
+        signal0: cute.Pointer,
+        signal1: cute.Pointer,
+        signal2: cute.Pointer,
+        signal3: cute.Pointer,
+        signal4: cute.Pointer,
+        signal5: cute.Pointer,
+        signal6: cute.Pointer,
+        signal7: cute.Pointer,
+        signal8: cute.Pointer,
+        signal9: cute.Pointer,
+        signal10: cute.Pointer,
+        signal11: cute.Pointer,
+        signal12: cute.Pointer,
+        signal13: cute.Pointer,
+        signal14: cute.Pointer,
+        signal15: cute.Pointer,
+        lse_offset: Int64,
+        batch: Int32,
+        total_heads: Int32,
+        head_dim: Int32,
+        input_stride_batch: Int64,
+        input_stride_head: Int64,
+        output_stride_batch: Int64,
+        output_stride_head: Int64,
+        natural_log: Int32,
+        slot_delta_256b: Int32,
+    ) -> None:
+        staging = (
+            staging0,
+            staging1,
+            staging2,
+            staging3,
+            staging4,
+            staging5,
+            staging6,
+            staging7,
+            staging8,
+            staging9,
+            staging10,
+            staging11,
+            staging12,
+            staging13,
+            staging14,
+            staging15,
+        )
+        signals = (
+            signal0,
+            signal1,
+            signal2,
+            signal3,
+            signal4,
+            signal5,
+            signal6,
+            signal7,
+            signal8,
+            signal9,
+            signal10,
+            signal11,
+            signal12,
+            signal13,
+            signal14,
+            signal15,
+        )
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        gdim, _, _ = cute.arch.grid_dim()
+        slot_offset = Int64(0)
+        if cutlass.const_expr(self._device_slot_selection):
+            generation = ld_relaxed_gpu_u32(
+                (signals[self._rank] + Int64(_GRAPH_EPOCH_INDEX)).toint()
+            )
+            slot = generation % Uint32(2)
+            slot_offset = Int64(slot) * Int64(slot_delta_256b) * Int64(_SLOT_ALIGNMENT)
+        lane = Int32(tidx) % Int32(32)
+        warp_first = Int32(bidx) * Int32(self._warps_per_block) + Int32(tidx) // Int32(
+            32
+        )
+        warp_stride = Int32(gdim) * Int32(self._warps_per_block)
+        heads_per_rank = total_heads // Int32(self._world_size)
+        packs_per_head = head_dim // Int32(8)
+        rows = batch * heads_per_rank
+        roles = self._roles
+        first = roles["first"]
+        second = roles["second"]
+        duty = roles["duty"]
+        terms = roles["terms"]
+        own_lse_base = Int64(staging[self._rank].toint()) + slot_offset + lse_offset
+
+        # First the rows nothing waits for: this rank's partials for the heads of the ranks
+        # across from its quad peers, to those peers, and the rows it exchanges with rank 8.
+        row = warp_first
+        while row < rows:
+            batch_index = row // heads_per_rank
+            local_head = row - batch_index * heads_per_rank
+            self._push_rows(
+                first,
+                local_output,
+                local_lse,
+                staging,
+                slot_offset,
+                lse_offset,
+                batch_index,
+                local_head,
+                total_heads,
+                heads_per_rank,
+                packs_per_head,
+                input_stride_batch,
+                input_stride_head,
+                lane,
+            )
+            row += warp_stride
+        self._quad_barrier(signals, roles["first_mask"])
+
+        if cutlass.const_expr(roles["across"] is not None):
+            across = roles["across"]
+            partial_first = roles["partial"][0]
+            partial_second = roles["partial"][1]
+            sources = len(duty) + 1
+            across_staging = staging[across] + slot_offset
+            across_lse = self._staging_lse(across_staging, lse_offset)
+            across_base = Int64(staging[across].toint()) + slot_offset
+            row = warp_first
+            while row < rows:
+                batch_index = row // heads_per_rank
+                local_head = row - batch_index * heads_per_rank
+                # The rows for the quad peers' own heads travel while the partial forms.
+                self._push_rows(
+                    second,
+                    local_output,
+                    local_lse,
+                    staging,
+                    slot_offset,
+                    lse_offset,
+                    batch_index,
+                    local_head,
+                    total_heads,
+                    heads_per_rank,
+                    packs_per_head,
+                    input_stride_batch,
+                    input_stride_head,
+                    lane,
+                )
+                head_row = Int64(batch_index) * Int64(total_heads) + Int64(local_head)
+                across_row = head_row + Int64(across) * Int64(heads_per_rank)
+                lane_address = Int64(local_lse.toint()) + across_row * Int64(4)
+                for index in cutlass.range_constexpr(len(duty)):
+                    if lane == Int32(index + 1):
+                        lane_address = own_lse_base + (
+                            head_row + Int64(duty[index]) * Int64(heads_per_rank)
+                        ) * Int64(4)
+                lane_lse = Float32(float("-inf"))
+                if lane < Int32(sources):
+                    lane_lse = ld_generic_f32(lane_address)
+                    if not cute.math.isfinite(lane_lse):
+                        lane_lse = Float32(float("-inf"))
+                weights = cute.make_rmem_tensor((sources,), Float32)
+                max_lse, weight_sum = self._lse_weights(
+                    weights, sources, lane_lse, natural_log
+                )
+                inv_weight_sum = Float32(1.0) / fmax_f32(weight_sum, Float32(1.0e-10))
+                # The partial's LSE is the log of the four ranks' summed weights.
+                combined = Float32(float("-inf"))
+                if weight_sum > Float32(0.0):
+                    if natural_log != Int32(0):
+                        combined = max_lse + cute.math.log(weight_sum, fastmath=False)
+                    else:
+                        combined = max_lse + cute.math.log2(weight_sum, fastmath=False)
+                first_row = head_row + Int64(partial_first) * Int64(heads_per_rank)
+                second_row = head_row + Int64(partial_second) * Int64(heads_per_rank)
+                if lane == Int32(0):
+                    cute.arch.store(across_lse + first_row, combined)
+                row_addresses = cute.make_rmem_tensor((sources,), Int64)
+                row_addresses[0] = (
+                    local_output.toint()
+                    + (
+                        Int64(batch_index) * input_stride_batch
+                        + (Int64(across) * Int64(heads_per_rank) + Int64(local_head))
+                        * input_stride_head
+                    )
+                    * Int64(16)
+                )
+                for index in cutlass.range_constexpr(len(duty)):
+                    row_addresses[index + 1] = _add_u64_opaque(
+                        staging[self._rank].toint(),
+                        slot_offset
+                        + (head_row + Int64(duty[index]) * Int64(heads_per_rank))
+                        * Int64(packs_per_head)
+                        * Int64(16),
+                    )
+                for pack in cutlass.range(
+                    lane,
+                    packs_per_head,
+                    Int32(32),
+                    unroll=1,
+                ):
+                    accum = cute.make_rmem_tensor((8,), Float32)
+                    for element in cutlass.range_constexpr(8):
+                        accum[element] = Float32(0.0)
+                    for index in cutlass.range_constexpr(sources):
+                        normalized_weight = weights[index] * inv_weight_sum
+                        if normalized_weight != Float32(0.0):
+                            words = _ld_generic_v4_u32(
+                                row_addresses[index] + Int64(pack) * Int64(16)
+                            )
+                            for pair in cutlass.range_constexpr(4):
+                                lo, hi = self._unpack_pair(words[pair])
+                                accum[pair * 2] = _fma_rn_f32(
+                                    normalized_weight, lo, accum[pair * 2]
+                                )
+                                accum[pair * 2 + 1] = _fma_rn_f32(
+                                    normalized_weight, hi, accum[pair * 2 + 1]
+                                )
+                    # Eight FP32 values: four into each of the destination's two groups.
+                    st_global_v4_f32(
+                        across_base
+                        + (first_row * Int64(packs_per_head) + Int64(pack)) * Int64(16),
+                        accum[0],
+                        accum[1],
+                        accum[2],
+                        accum[3],
+                    )
+                    st_global_v4_f32(
+                        across_base
+                        + (second_row * Int64(packs_per_head) + Int64(pack)) * Int64(16),
+                        accum[4],
+                        accum[5],
+                        accum[6],
+                        accum[7],
+                    )
+                row += warp_stride
+            self._quad_barrier(signals, roles["second_mask"])
+
+        count = len(terms)
+        row = warp_first
+        while row < rows:
+            batch_index = row // heads_per_rank
+            local_head = row - batch_index * heads_per_rank
+            global_head = Int32(self._rank) * heads_per_rank + local_head
+            head_row = Int64(batch_index) * Int64(total_heads) + Int64(local_head)
+            source_row = head_row + Int64(self._rank) * Int64(heads_per_rank)
+            lane_address = Int64(local_lse.toint()) + source_row * Int64(4)
+            for index in cutlass.range_constexpr(1, count):
+                if lane == Int32(index):
+                    lane_address = own_lse_base + (
+                        head_row + Int64(terms[index][1]) * Int64(heads_per_rank)
+                    ) * Int64(4)
+            lane_lse = Float32(float("-inf"))
+            if lane < Int32(count):
+                lane_lse = ld_generic_f32(lane_address)
+                if not cute.math.isfinite(lane_lse):
+                    lane_lse = Float32(float("-inf"))
+            weights = cute.make_rmem_tensor((count,), Float32)
+            max_lse, weight_sum = self._lse_weights(weights, count, lane_lse, natural_log)
+            inv_weight_sum = Float32(1.0) / fmax_f32(weight_sum, Float32(1.0e-10))
+            local_base = (
+                Int64(batch_index) * input_stride_batch
+                + Int64(global_head) * input_stride_head
+            )
+            output_base = (
+                Int64(batch_index) * output_stride_batch
+                + Int64(local_head) * output_stride_head
+            )
+            row_addresses = cute.make_rmem_tensor((count + 1,), Int64)
+            row_addresses[0] = local_output.toint() + local_base * Int64(16)
+            for index in cutlass.range_constexpr(1, count):
+                row_addresses[index] = _add_u64_opaque(
+                    staging[self._rank].toint(),
+                    slot_offset
+                    + (head_row + Int64(terms[index][1]) * Int64(heads_per_rank))
+                    * Int64(packs_per_head)
+                    * Int64(16),
+                )
+            row_addresses[count] = row_addresses[count - 1]
+            if cutlass.const_expr(terms[count - 1][0] == "partial"):
+                row_addresses[count] = _add_u64_opaque(
+                    staging[self._rank].toint(),
+                    slot_offset
+                    + (head_row + Int64(terms[count - 1][2]) * Int64(heads_per_rank))
+                    * Int64(packs_per_head)
+                    * Int64(16),
+                )
+            for pack in cutlass.range(
+                lane,
+                packs_per_head,
+                Int32(32),
+                unroll=1,
+            ):
+                accum = cute.make_rmem_tensor((8,), Float32)
+                for element in cutlass.range_constexpr(8):
+                    accum[element] = Float32(0.0)
+                for index in cutlass.range_constexpr(count):
+                    normalized_weight = weights[index] * inv_weight_sum
+                    if normalized_weight != Float32(0.0):
+                        if cutlass.const_expr(terms[index][0] == "partial"):
+                            # The other quad's FP32 partial: four values in each group.
+                            low = ld_global_v4_f32(
+                                row_addresses[index] + Int64(pack) * Int64(16)
+                            )
+                            high = ld_global_v4_f32(
+                                row_addresses[index + 1] + Int64(pack) * Int64(16)
+                            )
+                            for element in cutlass.range_constexpr(4):
+                                accum[element] = _fma_rn_f32(
+                                    normalized_weight, low[element], accum[element]
+                                )
+                                accum[element + 4] = _fma_rn_f32(
+                                    normalized_weight, high[element], accum[element + 4]
+                                )
+                        else:
+                            words = _ld_generic_v4_u32(
+                                row_addresses[index] + Int64(pack) * Int64(16)
+                            )
+                            for pair in cutlass.range_constexpr(4):
+                                lo, hi = self._unpack_pair(words[pair])
+                                accum[pair * 2] = _fma_rn_f32(
+                                    normalized_weight, lo, accum[pair * 2]
+                                )
+                                accum[pair * 2 + 1] = _fma_rn_f32(
+                                    normalized_weight, hi, accum[pair * 2 + 1]
+                                )
                 result0 = self._pack_pair(accum[0], accum[1])
                 result1 = self._pack_pair(accum[2], accum[3])
                 result2 = self._pack_pair(accum[4], accum[5])
@@ -2843,19 +3412,30 @@ def _get_compiled_lse_reduce_scatter(
     dtype_name: str,
     threads: int,
     device_slot_selection: bool,
+    quad: bool = False,
 ) -> Callable:
     """Compile and retain one LSE reduce-scatter launcher specialization."""
     push_tp8 = (int(world_size) == 8 and lse_push_tp8_enabled()) or (
         int(world_size) == 9 and lse_push_tp9_enabled()
     )
-    launch = _LseReduceScatterLaunch(
-        world_size,
-        rank,
-        dtype_name,
-        threads,
-        device_slot_selection,
-        push_tp8,
-    )
+    if quad:
+        # The quad-partial transport of nine ranks is a plan declaration.
+        launch = _LseQuadReduceScatterLaunch(
+            world_size,
+            rank,
+            dtype_name,
+            threads,
+            device_slot_selection,
+        )
+    else:
+        launch = _LseReduceScatterLaunch(
+            world_size,
+            rank,
+            dtype_name,
+            threads,
+            device_slot_selection,
+            push_tp8,
+        )
     key = (
         int(world_size),
         int(rank),
@@ -2870,7 +3450,10 @@ def _get_compiled_lse_reduce_scatter(
         "threads",
         "device_slot_selection",
     )
-    if push_tp8:
+    if quad:
+        key = (*key, "quad")
+        labels = (*labels, "tp9_transport")
+    elif push_tp8:
         # Only the opt-in variant extends the compile identity, so default
         # (pull) TP8 programs keep their existing cache keys.
         key = (*key, "push")
