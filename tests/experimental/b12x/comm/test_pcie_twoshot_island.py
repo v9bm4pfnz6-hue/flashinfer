@@ -1,4 +1,4 @@
-"""2-island hierarchical BF16 two-shot all-reduce (transports island / island_overlap).
+"""2-island hierarchical BF16 two-shot all-reduce (transports island / island_overlap / island_eighth).
 
 Unit tests run anywhere. The GPU test needs eight CUDA devices ordered as two
 PCIe islands (ranks 0-3, 4-7; partner = rank ^ 4) and is opt-in:
@@ -25,7 +25,7 @@ WORLD_SIZE = 8
 ROW_ELEMS = 7168
 MAX_ROWS = 3072
 ROWS = (1, 7, 300, 3072)
-GPU_TRANSPORTS = ("island", "island_overlap")
+GPU_TRANSPORTS = ("island", "island_overlap", "island_eighth")
 
 
 @pytest.mark.parametrize("transport", tp.ISLAND_TRANSPORTS)
@@ -45,7 +45,7 @@ def test_island_eligibility_needs_world_eight_and_whole_quarters():
 @pytest.mark.parametrize(
     "env, expected",
     (("0", "pull"), ("", "pull"), ("1", "island"), ("fp32", "island"),
-     ("bf16", "island_bf16"), ("overlap", "island_overlap")),
+     ("bf16", "island_bf16"), ("overlap", "island_overlap"), ("eighth", "island_eighth")),
 )
 def test_env_remaps_large_world_eight_reductions(monkeypatch, env, expected):
     monkeypatch.setenv("B12X_PCIE_TWOSHOT_ISLAND", env)
@@ -205,3 +205,179 @@ def test_world_eight_island_all_reduce_matches_reference_on_all_ranks():
     if not torch.cuda.is_available() or torch.cuda.device_count() != WORLD_SIZE:
         pytest.skip("needs exactly eight CUDA devices in island order")
     mp.spawn(_worker, args=(_free_port(),), nprocs=WORLD_SIZE, join=True)
+
+
+# ---- owner-eighth (island_eighth) protocol emulator: CPU-only check of the kernel's schedule ----
+
+
+def _emulate_island_eighth(operands, *, immediate_remote: bool, footprint: dict, descending: bool = True):
+    """NumPy model of `_TwoShotIslandEighthAllReduceLaunch` (same indices).
+
+    operands: float32 array (8, packs, 8) holding BF16-exact values. Each
+    iteration runs all ranks; remote stores are applied immediately (in rank
+    order 7..0, the adversarial order for reads of rank 0..7) or deferred to
+    the barrier. A missing barrier (read of a same-iteration remote write) or a
+    premature overwrite (write-after-read across ranks) changes the result in
+    one of the two modes. ``footprint`` collects the half index j touching each
+    (rank, buffer, unit) to check the per-CTA contract.
+    """
+    import numpy as np
+    from b12x.comm.pcie import _twoshot_bf16_cute as cute_mod
+
+    def bf16(values):
+        return torch.from_numpy(np.ascontiguousarray(values, dtype=np.float32)).to(torch.bfloat16).float().numpy()
+
+    world, total, _ = operands.shape
+    quarter = total // 4
+    stages = cute_mod._ISLAND_OVERLAP_STAGES
+    sub = cute_mod.island_eighth_sub_packs(quarter)
+    half = sub // 2
+    units = cute_mod._EIGHTH_AREA_UNITS * sub
+    staging = np.full((world, units, 8), np.nan, dtype=np.float32)
+    output = np.full((world, total, 8), np.nan, dtype=np.float32)
+    deferred = []
+
+    def touch(rank, buffer, unit, j):
+        key = (rank, buffer, int(unit))
+        assert footprint.setdefault(key, j) == j, ("per-CTA footprint violated", key, j, footprint[key])
+
+    def store(writer, rank, unit, value, j):
+        touch(rank, "staging", unit, j)
+        if rank != writer and not immediate_remote:
+            deferred.append((rank, unit, value.copy()))
+        else:
+            staging[rank, unit] = value
+
+    def load(rank, unit, j):
+        touch(rank, "staging", unit, j)
+        value = staging[rank, unit].copy()
+        assert not np.isnan(value).any(), ("read before write", rank, unit)
+        return value
+
+    def out_store(rank, pack, value, j):
+        touch(rank, "output", pack, j)
+        output[rank, pack] = value
+
+    order = list(range(world - 1, -1, -1)) if descending else list(range(world))
+    for step in range(stages + 4):
+        for rank in order:
+            base, local, partner, island_a = rank & 4, rank & 3, rank ^ 4, rank < 4
+            mine, theirs = (0, half) if island_a else (half, 0)
+            for j in range(half):
+                if step < stages:  # A
+                    first, parity = step * sub, step & 1
+                    for hop in (1, 2, 3):
+                        peer_local = (local + hop) & 3
+                        for position in (j, j + half):
+                            if first + position < quarter:
+                                store(rank, base + peer_local,
+                                      (cute_mod._EIGHTH_RS + parity * 4 + local) * sub + position,
+                                      operands[rank, peer_local * quarter + first + position], j)
+                if 1 <= step <= stages:  # B
+                    chunk_id = step - 1
+                    first, parity = chunk_id * sub, chunk_id & 1
+                    for side, offset in ((0, mine), (1, theirs)):
+                        position = j + offset
+                        if first + position < quarter:
+                            acc = None
+                            for source_local in range(4):
+                                if source_local == local:
+                                    value = operands[rank, local * quarter + first + position]
+                                else:
+                                    value = load(rank, (cute_mod._EIGHTH_RS + parity * 4 + source_local) * sub + position, j)
+                                acc = value.astype(np.float32) if acc is None else (acc + value).astype(np.float32)
+                            target_rank = rank if side == 0 else partner
+                            area = (cute_mod._EIGHTH_OWN if side == 0 else cute_mod._EIGHTH_PIN) + parity
+                            store(rank, target_rank, area * sub + j, np.concatenate([acc[:4], [0.0] * 4]).astype(np.float32), j)
+                            store(rank, target_rank, area * sub + half + j, np.concatenate([acc[4:], [0.0] * 4]).astype(np.float32), j)
+                if 2 <= step <= stages + 1:  # C
+                    chunk_id = step - 2
+                    first, parity = chunk_id * sub, chunk_id & 1
+                    position = j + mine
+                    if first + position < quarter:
+                        own = np.concatenate([load(rank, (cute_mod._EIGHTH_OWN + parity) * sub + j, j)[:4],
+                                              load(rank, (cute_mod._EIGHTH_OWN + parity) * sub + half + j, j)[:4]])
+                        peer = np.concatenate([load(rank, (cute_mod._EIGHTH_PIN + parity) * sub + j, j)[:4],
+                                               load(rank, (cute_mod._EIGHTH_PIN + parity) * sub + half + j, j)[:4]])
+                        final = bf16((own + peer).astype(np.float32))
+                        out_store(rank, local * quarter + first + position, final, j)
+                        store(rank, partner, cute_mod._EIGHTH_FIN * sub + parity * half + j, final, j)
+                        for hop in (1, 2, 3):
+                            peer_local = (local + hop) & 3
+                            store(rank, base + peer_local,
+                                  (cute_mod._EIGHTH_AG + (chunk_id % 3) * 4 + local) * sub + position, final, j)
+                if 3 <= step <= stages + 2:  # D
+                    chunk_id = step - 3
+                    first, parity = chunk_id * sub, chunk_id & 1
+                    position = j + theirs
+                    if first + position < quarter:
+                        final = load(rank, cute_mod._EIGHTH_FIN * sub + parity * half + j, j)
+                        out_store(rank, local * quarter + first + position, final, j)
+                        for hop in (1, 2, 3):
+                            peer_local = (local + hop) & 3
+                            store(rank, base + peer_local,
+                                  (cute_mod._EIGHTH_AG + (chunk_id % 3) * 4 + local) * sub + position, final, j)
+                if step >= 4:  # E
+                    chunk_id = step - 4
+                    first = chunk_id * sub
+                    for hop in (1, 2, 3):
+                        source_local = (local + hop) & 3
+                        for position in (j, j + half):
+                            if first + position < quarter:
+                                out_store(rank, source_local * quarter + first + position,
+                                          load(rank, (cute_mod._EIGHTH_AG + (chunk_id % 3) * 4 + source_local) * sub + position, j), j)
+        for rank, unit, value in deferred:  # barrier
+            staging[rank, unit] = value
+        deferred.clear()
+    return output
+
+
+@pytest.mark.parametrize("packs", (896, 4 * 13 * 7, 4 * 896 * 3, 4 * 37))
+def test_island_eighth_protocol_emulation_is_exact_and_race_free(packs):
+    import numpy as np
+
+    generator = torch.Generator().manual_seed(packs)
+    operands = torch.randn((WORLD_SIZE, packs, 8), generator=generator).to(torch.bfloat16).float().numpy()
+    quarter = packs // 4
+    results = []
+    for immediate, descending in ((False, True), (True, True), (True, False)):
+        footprint = {}
+        out = _emulate_island_eighth(
+            operands, immediate_remote=immediate, footprint=footprint, descending=descending
+        )
+        assert not np.isnan(out).any()
+        results.append(out)
+    # No same-iteration cross-rank dependency (RAW or WAR) in either issue order.
+    assert np.array_equal(results[0], results[1]) and np.array_equal(results[0], results[2])
+    out = results[0]
+    assert all(np.array_equal(out[0], out[rank]) for rank in range(WORLD_SIZE))  # identical ranks
+    # One rounding of (island A partial in order 0..3) + (island B partial in order 0..3), FP32.
+    a = operands[0].astype(np.float32)
+    for r in (1, 2, 3):
+        a = (a + operands[r]).astype(np.float32)
+    b = operands[4].astype(np.float32)
+    for r in (5, 6, 7):
+        b = (b + operands[r]).astype(np.float32)
+    expected = torch.from_numpy((a + b).astype(np.float32)).to(torch.bfloat16).float().numpy()
+    assert np.array_equal(out[0], expected)
+    assert quarter * 4 == packs
+
+
+def test_island_eighth_staging_fits_push_slot_and_env():
+    from b12x.comm.pcie._twoshot_bf16_cute import island_eighth_fits, island_eighth_sub_packs
+
+    total = MAX_ROWS * ROW_ELEMS // 8
+    pack_stride = -(-(-(-total // WORLD_SIZE)) // 16) * 16
+    for rows in (1, 7, 300, 1536, MAX_ROWS):
+        quarter = rows * ROW_ELEMS // 8 // 4
+        assert island_eighth_sub_packs(quarter) % 2 == 0
+        assert island_eighth_sub_packs(quarter) * _ISLAND_OVERLAP_STAGES >= quarter
+        assert island_eighth_fits(quarter, pack_stride)
+    assert not island_eighth_fits(4096, 16)
+
+
+def test_island_eighth_launcher_rejects_conflicting_variants():
+    with pytest.raises(ValueError, match="FP32 partials only"):
+        get_twoshot_bf16_island_launcher(8, 0, False, 0, 512, 8, 0, True, False, True)
+    with pytest.raises(ValueError, match="one island pipeline variant"):
+        get_twoshot_bf16_island_launcher(8, 0, False, 0, 512, 8, 0, False, True, True)

@@ -376,7 +376,7 @@ class PCIeTwoShotBF16:
         transport = (
             state.query.call["transport"] if operation == "all_reduce" else "push"
         )
-        island = transport in ("island", "island_bf16", "island_overlap")
+        island = transport in ("island", "island_bf16", "island_overlap", "island_eighth")
         if operation == "all_gather":
             shard_packs = payload_packs
             total_packs = payload_packs * self.world_size
@@ -399,6 +399,13 @@ class PCIeTwoShotBF16:
                 raise ValueError("pcie_twoshot_bf16 staging capacity exceeded")
             # The grid covers one pipeline sub-chunk of the quarter.
             grid_packs = -(-shard_packs // _ISLAND_OVERLAP_STAGES)
+        if transport == "island_eighth":
+            from ._twoshot_bf16_cute import island_eighth_fits, island_eighth_sub_packs
+
+            if not island_eighth_fits(shard_packs, self._pack_stride):
+                raise ValueError("pcie_twoshot_bf16 staging capacity exceeded")
+            # The grid covers one half (eighth-owner) of a pipeline sub-chunk.
+            grid_packs = island_eighth_sub_packs(shard_packs) // 2
         if (
             int(threads) != state.query.call["threads"]
             or int(block_limit) != state.query.call["block_limit"]
