@@ -393,13 +393,14 @@ def test_tree_runtime_operations_reduce_two_consecutive_tensors(monkeypatch, pie
         runtime = pcie_dma.PCIeDmaAllReduce.__new__(pcie_dma.PCIeDmaAllReduce)
         runtime.world_size, runtime.rank, runtime.device = world, rank, "fake"
         runtime._tree = ROUTING
+        runtime._tree_primed = True
         runtime._pieces_override = pieces
         runtime._tree_arena_bytes, runtime._tree_stage_bytes = arena, stage_bytes
         runtime._scratch_base = [base + flags_bytes for base in slabs]
         runtime._tree_flags_base = [base + flags_bytes + arena for base in slabs]
         runtime._tree_stage = _FakeTensor(space, stage_bytes, torch.uint8)
-        runtime._tree_send_counters = _FakeTensor(space, len(pcie_dma.TREE_PIECES) * pcie_dma.TREE_BANK_SENDS * 4, torch.int32)
-        runtime._tree_wait_counters = _FakeTensor(space, len(pcie_dma.TREE_PIECES) * pcie_dma.TREE_BANK_SLOTS * 4, torch.int32)
+        runtime._tree_send_counters = _FakeTensor(space, (len(pcie_dma.TREE_PIECES) * pcie_dma.TREE_BANK_SENDS + 1) * 4, torch.int32)
+        runtime._tree_wait_counters = _FakeTensor(space, (len(pcie_dma.TREE_PIECES) * pcie_dma.TREE_BANK_SLOTS + 1) * 4, torch.int32)
         machine.streams = {name: _Stream(machine, name) for name in tree.STREAMS if name != "main"}
         runtime._tree_streams = machine.streams
         runtime._tree_events = {count: [] for count in pcie_dma.TREE_PIECES}
@@ -446,3 +447,65 @@ def test_tree_runtime_operations_reduce_two_consecutive_tensors(monkeypatch, pie
         for rank in range(world):
             assert torch.equal(results[index][rank].view(torch.int16),
                                expected[0].reshape(-1).view(torch.int16)), (index, rank)
+
+
+def test_tree_runtime_primes_every_kernel_before_any_wait_and_issues_values_first():
+    """A rank loads its kernels on private storage first; within a reduction its own values go out before any wait."""
+    from b12x.comm.pcie import pcie_dma
+
+    order = tree.ISSUE_ORDER
+    assert sorted(order) == sorted(tree.STREAMS)
+    position = {name: index for index, name in enumerate(order)}
+    # Recorded before waited for: sums before the copies that send them, arrivals before their forwards,
+    # copies before their flags; and the unconditional sends come first.
+    assert position["raw"] < position["raw_flag"] < position["main"] < position["partial"] < position["partial_flag"]
+    assert position["main"] < position["result"] < position["result_flag"]
+    assert position["receive"] < position["relay"] < position["relay_flag"]
+    plan = tree.schedule(ROUTING, 2)
+    for rank in range(plan.world_size):
+        streams, _ = tree.program(plan, rank)
+        recorded = set()
+        for name in order:
+            for operation in streams[name]:
+                if operation[0] == "copy":
+                    assert operation[3] is None or operation[3] in recorded
+                    recorded.add(operation[4])
+                elif operation[0] == "flag":
+                    assert operation[2] in recorded
+                elif operation[0] in ("accumulate", "mark"):
+                    recorded.add(operation[-1])
+
+    space = _Space()
+    machine = _Machine(space)
+    launched = []
+    machine.dma_tree_accum = lambda destination, values, partials, elems, final: launched.append(
+        (len(values), len(partials), final, elems))
+    machine._require_launchers = lambda: type("Launchers", (), {"tree_accum": tuple(
+        (variant, None) for variant in plan.variants)})()
+    runtime = pcie_dma.PCIeDmaAllReduce.__new__(pcie_dma.PCIeDmaAllReduce)
+    runtime.rank, runtime.device, runtime._kernels = 0, "fake", machine
+    banks = len(pcie_dma.TREE_PIECES)
+    slab = space.allocate((banks * pcie_dma.TREE_BANK_SLOTS + 1) * pcie_dma.FLAG_STRIDE)
+    runtime._tree_flags_base = [slab]
+    runtime._tree_stage = _FakeTensor(space, 256, torch.uint8)
+    runtime._tree_send_counters = _FakeTensor(space, (banks * pcie_dma.TREE_BANK_SENDS + 1) * 4, torch.int32)
+    runtime._tree_wait_counters = _FakeTensor(space, (banks * pcie_dma.TREE_BANK_SLOTS + 1) * 4, torch.int32)
+    runtime._tree_primed = False
+
+    class Cuda:
+        is_current_stream_capturing = staticmethod(lambda: False)
+        device = staticmethod(lambda device: machine.stream(machine.main))
+        current_stream = staticmethod(lambda device=None: type("S", (), {"synchronize": lambda self: None})())
+
+    original = pcie_dma.torch.cuda
+    pcie_dma.torch.cuda = Cuda
+    try:
+        runtime._prime_tree()
+    finally:
+        pcie_dma.torch.cuda = original
+    assert runtime._tree_primed
+    assert sorted(launched) == sorted((values, partials, final, 8) for values, partials, final in plan.variants)
+    kinds = [operation[0] for operation in machine.main.operations]
+    assert kinds == ["set_flag", "wait_flag", "copy"]
+    # The priming flag is the slot after the last bank, which no schedule addresses.
+    assert machine.main.operations[0][1] == slab + banks * pcie_dma.TREE_BANK_SLOTS * pcie_dma.FLAG_STRIDE

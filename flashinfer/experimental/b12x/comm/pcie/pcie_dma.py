@@ -24,6 +24,7 @@ from b12x.preparation.types import Plan, require_prepared
 
 from ._dma_kernels import DmaKernels
 from ._dma_tree import (
+    ISSUE_ORDER as TREE_ISSUE_ORDER,
     STREAMS as TREE_STREAMS,
     program as tree_program,
     schedule as tree_schedule,
@@ -355,7 +356,8 @@ class PCIeDmaAllReduce:
                 SCRATCH_ALIGN,
             )
             scratch_bytes = self._tree_arena_bytes
-            tree_flags_bytes = len(TREE_PIECES) * TREE_BANK_SLOTS * FLAG_STRIDE
+            # One more slot than the banks hold: the flag a rank primes its kernels with.
+            tree_flags_bytes = (len(TREE_PIECES) * TREE_BANK_SLOTS + 1) * FLAG_STRIDE
         slab_bytes = flags_bytes + scratch_bytes + tree_flags_bytes
         self._slab_nbytes = slab_bytes
         self._slab = PCIeOneshotAllReduce._allocate_shared_buffer(
@@ -432,11 +434,12 @@ class PCIeDmaAllReduce:
                     "a tree channel takes neither a compressed wire nor the ring's BF16 gather"
                 )
             banks = len(TREE_PIECES)
+            self._tree_primed = False
             self._tree_send_counters = torch.zeros(
-                banks * TREE_BANK_SENDS, dtype=torch.int32, device=self.device
+                banks * TREE_BANK_SENDS + 1, dtype=torch.int32, device=self.device
             )
             self._tree_wait_counters = torch.zeros(
-                banks * TREE_BANK_SLOTS, dtype=torch.int32, device=self.device
+                banks * TREE_BANK_SLOTS + 1, dtype=torch.int32, device=self.device
             )
             self._tree_stage = torch.empty(
                 self._tree_stage_bytes, dtype=torch.uint8, device=self.device
@@ -1107,6 +1110,35 @@ class PCIeDmaAllReduce:
                 return pieces
         return 1
 
+    def _prime_tree(self) -> None:
+        """Load every kernel of the tree protocol into the context before its first reduction.
+
+        A launcher loads its module at its first call, and that load does not return while a
+        flag wait is polling on the device: a rank that issued a wait and then met an unloaded
+        accumulate kernel stopped there, before it had sent the values its peers were waiting
+        for. The calls here touch this rank's stage and a flag slot no schedule uses.
+        """
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("a tree channel runs once eagerly before it is captured in a graph")
+        kernels = self._kernels
+        banks = len(TREE_PIECES)
+        with torch.cuda.device(self.device):
+            flag = self._tree_flags_base[self.rank] + banks * TREE_BANK_SLOTS * FLAG_STRIDE
+            kernels.dma_set_flag(
+                flag, self._counter_ptr(self._tree_send_counters, banks * TREE_BANK_SENDS)
+            )
+            kernels.dma_wait_flag(
+                flag, self._counter_ptr(self._tree_wait_counters, banks * TREE_BANK_SLOTS)
+            )
+            stage = self._tree_stage.data_ptr()
+            kernels.dma_copy(stage, stage + 128, 16)
+            for (values, partials, final), _ in kernels._require_launchers().tree_accum:
+                kernels.dma_tree_accum(
+                    stage, [stage + 64] * values, [stage + 128] * partials, 8, final
+                )
+            torch.cuda.current_stream(self.device).synchronize()
+        self._tree_primed = True
+
     def _run_tree(self, inp: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
         """Single-rounding BF16 all-reduce over the channel's switch tree (_dma_tree).
 
@@ -1132,6 +1164,8 @@ class PCIeDmaAllReduce:
             and out.data_ptr() < inp.data_ptr() + inp.nbytes
         ):
             raise ValueError("tree input and output must be the same tensor or disjoint")
+        if not self._tree_primed:
+            self._prime_tree()
         world, rank = self.world_size, self.rank
         chunk_elems = inp.numel() // world
         pieces = self._tree_pieces(chunk_elems)
@@ -1202,7 +1236,8 @@ class PCIeDmaAllReduce:
         self._input_ready.record(main)
         for stream in self._tree_streams.values():
             stream.wait_event(self._input_ready)
-        for name, operations in streams.items():
+        for name in TREE_ISSUE_ORDER:
+            operations = streams[name]
             stream = main if name == "main" else self._tree_streams[name]
             with torch.cuda.stream(stream):
                 for operation in operations:

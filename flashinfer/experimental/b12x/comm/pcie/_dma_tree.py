@@ -283,6 +283,10 @@ def schedule(routing: Topology, pieces: int) -> Schedule:
 # flag stream that publishes a copy's flag once that copy has completed.
 COPY_STREAMS = ("raw", "partial", "result", "relay")
 STREAMS = ("main", "receive", *COPY_STREAMS, *(name + "_flag" for name in COPY_STREAMS))
+# Order in which a rank issues its streams. An event is recorded before the operations that wait
+# for it are issued, and what needs no arrival (a rank's own values) is issued before any wait.
+ISSUE_ORDER = ("raw", "raw_flag", "main", "partial", "partial_flag", "result", "result_flag",
+               "receive", "relay", "relay_flag")
 
 
 @lru_cache(maxsize=None)
@@ -339,5 +343,5 @@ def program(plan: Schedule, rank: int) -> tuple[dict[str, tuple[tuple, ...]], in
     return {name: tuple(operations) for name, operations in streams.items()}, events
 
 
-__all__ = ["Accumulate", "COPY_STREAMS", "Edge", "PAIRS_2_2_2_2_1", "Receive", "STREAMS", "Schedule",
+__all__ = ["Accumulate", "COPY_STREAMS", "Edge", "ISSUE_ORDER", "PAIRS_2_2_2_2_1", "Receive", "STREAMS", "Schedule",
            "TOPOLOGIES", "Topology", "program", "schedule", "topology"]
