@@ -111,6 +111,7 @@ class W4A16FusedMoeKernel:
         trellis_decode_table: str = "auto",
         small_m_occupancy: int | None = None,
         csf_inline_scales: bool = False,
+        small_m_splitk: bool | None = None,
     ):
         activation = normalize_moe_activation(activation)
         is_gated = validate_activation(activation)
@@ -185,7 +186,11 @@ class W4A16FusedMoeKernel:
         # scheduling and grouped FC2 route subtiles.
         self.small_m_splitk = (
             weight_layout in BLOCK_CODECS and moe_block_size == 8
-        ) or _w4a16_small_m_splitk_enabled()
+        ) or (
+            _w4a16_small_m_splitk_enabled()
+            if small_m_splitk is None
+            else bool(small_m_splitk)
+        )
         if self.small_m_splitk:
             schedule_whole_tiles = False
             fc2_schedule_route_block_factor = 1
@@ -374,6 +379,7 @@ class W4A16FusedMoeKernel:
             pipeline_stages=pipeline_stages,
             skip_empty_m_blocks=skip_empty_m_blocks,
             small_m_occupancy=small_m_occupancy,
+            small_m_splitk=small_m_splitk,
             csf_inline_scales=csf_inline_scales,
         )
         if (
@@ -426,6 +432,7 @@ class W4A16FusedMoeKernel:
             pipeline_stages=pipeline_stages,
             skip_empty_m_blocks=skip_empty_m_blocks,
             small_m_occupancy=small_m_occupancy,
+            small_m_splitk=small_m_splitk,
             csf_inline_scales=csf_inline_scales,
         )
         self.cta_threads = max(self.fc1.cta_threads, self.fc2.cta_threads)

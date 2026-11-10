@@ -86,6 +86,28 @@ def _w4a16_small_m_splitk_enabled() -> bool:
     return os.environ.get("B12X_W4A16_SMALL_M_SPLITK", "0") == "1"
 
 
+def _w4a16_trellis_decode_splitk(size_m: int) -> bool | None:
+    """Stripe split-K choice of one full-rotation Trellis launch, or None.
+
+    ``B12X_W4A16_SMALL_M_SPLITK=decode`` selects the stripe split-K schedule
+    for decode launches (fewer than 128 tokens, the boundary the measured
+    prefill launch shapes use) and whole-tile scheduling for prefill launches.
+    None leaves the choice to ``_w4a16_small_m_splitk_enabled``, so the values
+    ``0`` and ``1`` keep their meaning for every launch.
+
+    The split-K finalize adds the FP32 partial sums of the K slices in the
+    order their CTAs take the reduction lock, so a launch that uses it is not
+    run-to-run reproducible; a whole-tile launch is. Restricting the schedule
+    to decode keeps prefill results, and the cached states computed from them,
+    reproducible, while narrow decode rounds use the CTAs that whole-tile
+    scheduling leaves idle.
+    """
+
+    if os.environ.get("B12X_W4A16_SMALL_M_SPLITK", "0") != "decode":
+        return None
+    return int(size_m) < 128
+
+
 def _lut_e4m3_smem_enabled() -> bool:
     """Stage the 4 KiB ``lut_e4m3`` value table once per fused CTA.
 

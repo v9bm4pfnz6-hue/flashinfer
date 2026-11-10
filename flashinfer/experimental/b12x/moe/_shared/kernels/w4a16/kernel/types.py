@@ -88,6 +88,7 @@ class W4A16FusedMoeCompileResult:
     prefill_fused_sum_fp32: bool = False
     collect_activation_amax: bool = False
     schedule_whole_tiles: bool = False
+    small_m_splitk: bool = False
     intermediate_rotation: bool = False
     dual_a: bool = False
     trellis_bits: int = 3

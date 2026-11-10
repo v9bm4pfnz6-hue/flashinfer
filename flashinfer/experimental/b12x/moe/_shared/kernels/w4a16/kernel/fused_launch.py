@@ -44,6 +44,7 @@ from b12x.moe._shared.kernels.w4a16.kernel.config import (
     _trellis256_execution_lut,
     _w4a16_small_m_occupancy,
     _w4a16_small_m_splitk_enabled,
+    _w4a16_trellis_decode_splitk,
 )
 from b12x.moe._shared.kernels.w4a16.kernel.direct_launch import (
     _compile_w4a16_small_m_direct,
@@ -103,12 +104,22 @@ def compile_w4a16_fused_moe(
     _require_cached: bool = False,
     small_m_occupancy: int | None = None,
     csf_inline_scales: bool = False,
+    small_m_splitk: bool | None = None,
 ) -> W4A16FusedMoeCompileResult:
     if small_m_occupancy is None:
         small_m_occupancy = _w4a16_small_m_occupancy()
     scale_format = _normalize_scale_format(scale_format)
     intermediate_rotation = bool(intermediate_rotation)
     full_rotation = bool(full_rotation)
+    if (
+        small_m_splitk is None
+        and full_rotation
+        and fc1_trellis_pair_kind is None
+        and fc2_trellis_pair_kind is None
+    ):
+        # Every caller of the full-rotation Trellis kernel (planning, workspace
+        # resolution and the lazy launch) resolves the per-launch choice here.
+        small_m_splitk = _w4a16_trellis_decode_splitk(size_m)
     intermediate_hadamard = bool(intermediate_hadamard)
     rotation_input_dtype = (
         element_dtype if rotation_input_dtype is None else str(rotation_input_dtype)
@@ -516,6 +527,7 @@ def compile_w4a16_fused_moe(
         trellis_decode_table=trellis_decode_table,
         small_m_occupancy=small_m_occupancy,
         csf_inline_scales=csf_inline_scales,
+        small_m_splitk=small_m_splitk,
     )
     compile_key = ("w4a16_fused_moe", kernel.__cache_key__)
     cache_key = (device, compile_key)
@@ -785,6 +797,7 @@ def compile_w4a16_fused_moe(
         prefill_fused_sum_fp32=bool(prefill_fused_sum_fp32),
         collect_activation_amax=collect_activation_amax,
         schedule_whole_tiles=kernel.schedule_whole_tiles,
+        small_m_splitk=kernel.small_m_splitk,
         intermediate_rotation=intermediate_rotation,
         dual_a=kernel.dual_a,
         trellis_bits=trellis_bits,
@@ -1153,9 +1166,12 @@ def _w4a16_fused_persistent_grid_x(
     where the host cannot know route_blocks ahead of the launch.
     """
     cap = int(sms) * int(fused.blocks_per_sm)
+    small_m_splitk = getattr(fused, "small_m_splitk", None)
+    if small_m_splitk is None:
+        small_m_splitk = _w4a16_small_m_splitk_enabled()
     if (
         fused.weight_layout in BLOCK_CODECS and fused.moe_block_size == 8
-    ) or _w4a16_small_m_splitk_enabled():
+    ) or small_m_splitk:
         # Stripe split-K wants the full persistent grid: each small-M FC1
         # column's K range is fanned across many CTAs, so right-sizing the
         # grid to the mn-tile count would recreate the serialization the

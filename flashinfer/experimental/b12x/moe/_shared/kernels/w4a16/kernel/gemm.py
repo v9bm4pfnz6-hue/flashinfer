@@ -149,6 +149,7 @@ class W4A16GemmKernel:
         pipeline_stages: int | None = None,
         skip_empty_m_blocks: bool | None = None,
         small_m_occupancy: int | None = None,
+        small_m_splitk: bool | None = None,
         csf_inline_scales: bool = False,
     ):
         if element_dtype not in {"bf16", "fp16"}:
@@ -348,7 +349,11 @@ class W4A16GemmKernel:
         # multiple CTAs (existing tail scheduling plus cross-CTA finalize).
         self.small_m_splitk = (
             weight_layout in BLOCK_CODECS and moe_block_size == 8
-        ) or _w4a16_small_m_splitk_enabled()
+        ) or (
+            _w4a16_small_m_splitk_enabled()
+            if small_m_splitk is None
+            else bool(small_m_splitk)
+        )
         self.weight_layout_trellis256 = weight_layout == "trellis_t256"
         self.weight_layout_block = weight_layout in BLOCK_CODECS
         self.iq2_xxs = weight_layout == "iq2_xxs"
