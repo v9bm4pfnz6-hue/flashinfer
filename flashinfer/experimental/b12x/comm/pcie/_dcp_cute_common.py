@@ -105,6 +105,21 @@ def _load_acquire_sys_u32(
 
 
 @cute.jit
+def _lane_in_mask(tidx, world_size: int, lane_mask: int):
+    """Whether this thread is the barrier lane of a peer in ``lane_mask`` (bit p selects peer p).
+
+    A barrier over an arbitrary peer subset stays consistent when the relation
+    is symmetric: rank a selects b in the same barriers in which b selects a.
+    """
+    selected = Int32(0)
+    for peer in cutlass.range_constexpr(world_size):
+        if cutlass.const_expr((lane_mask >> peer) & 1 == 1):
+            if Int32(tidx) == Int32(peer):
+                selected = Int32(1)
+    return selected == Int32(1)
+
+
+@cute.jit
 def block_pair_barrier_acquire(
     signals: Sequence[cute.Pointer],
     *,
@@ -114,6 +129,7 @@ def block_pair_barrier_acquire(
     max_blocks: int,
     lane_first: int = 0,
     lane_count: int = -1,
+    lane_mask: int = -1,
 ) -> None:
     """``block_pair_barrier`` with the all-reduce flag scheme's consumer side.
 
@@ -127,7 +143,9 @@ def block_pair_barrier_acquire(
     cute.arch.sync_threads()
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
-    if cutlass.const_expr(lane_count < 0):
+    if cutlass.const_expr(lane_mask >= 0):
+        participate = _lane_in_mask(tidx, world_size, lane_mask)
+    elif cutlass.const_expr(lane_count < 0):
         participate = Int32(tidx) < Int32(world_size)
     else:
         # Peer subset [lane_first, lane_first + lane_count): pair counters and
@@ -175,6 +193,7 @@ def block_pair_barrier(
     max_blocks: int,
     lane_first: int = 0,
     lane_count: int = -1,
+    lane_mask: int = -1,
 ) -> None:
     """Match the native per-block, per-peer double-buffered barrier."""
     cute.arch.sync_threads()
@@ -185,7 +204,9 @@ def block_pair_barrier(
     # the participating lanes.  Keeping the body outside the constexpr loop
     # matches CUDA's runtime-indexed RankSignals path without cloning the
     # fence/store/poll sequence once per peer.
-    if cutlass.const_expr(lane_count < 0):
+    if cutlass.const_expr(lane_mask >= 0):
+        participate = _lane_in_mask(tidx, world_size, lane_mask)
+    elif cutlass.const_expr(lane_count < 0):
         participate = Int32(tidx) < Int32(world_size)
     else:
         # Peer subset [lane_first, lane_first + lane_count): pair counters and

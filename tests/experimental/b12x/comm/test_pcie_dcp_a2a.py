@@ -462,6 +462,54 @@ def test_pushed_kimi_pair_accepts_padded_shards_and_passes_their_packs(
         call(9)
 
 
+def test_pair_gather_roles_deliver_every_segment_with_symmetric_barriers() -> None:
+    """Emulate the nine-rank pair gather: pushes, first barrier, in-pair forwards, second barrier."""
+    from b12x.comm.pcie._dcp_a2a_cute import pair_gather_roles
+
+    roles = {rank: pair_gather_roles(rank) for rank in range(9)}
+    staging = {rank: set() for rank in range(9)}
+    for rank, role in roles.items():
+        assert rank not in role["direct"] and len(set(role["direct"])) == len(role["direct"])
+        for peer in role["direct"]:
+            staging[peer].add(rank)
+    for rank, role in roles.items():
+        # The relation of the first barrier is symmetric and covers every rank that pushed here.
+        assert all(rank in roles[peer]["first"] for peer in role["first"])
+        assert {source for source in range(9) if rank in roles[source]["direct"]} <= set(role["first"])
+        # What a rank forwards has been pushed to it and is not pushed to its partner by the source.
+        for source in role["forwarded"]:
+            assert rank in roles[source]["direct"] and role["partner"] not in roles[source]["direct"]
+    forwarded = {rank: set() for rank in range(9)}
+    for rank, role in roles.items():
+        if role["partner"] is not None:
+            assert roles[role["partner"]]["partner"] == rank
+            forwarded[role["partner"]] |= set(role["forwarded"])
+    for rank in range(9):
+        assert not staging[rank] & forwarded[rank]
+        assert staging[rank] | forwarded[rank] == set(range(9)) - {rank}
+    # Copies that leave or enter a pair, and copies that cross between ranks 0-3,8 and ranks 4-7.
+    side = lambda rank: 1 if 4 <= rank < 8 else 0
+    pushes = [(rank, peer) for rank, role in roles.items() for peer in role["direct"]]
+    for pair in range(4):
+        members = {2 * pair, 2 * pair + 1}
+        assert sum(a in members and b not in members for a, b in pushes) == 8
+        assert sum(a not in members and b in members for a, b in pushes) == 7
+    assert sum(side(a) == 0 and side(b) == 1 for a, b in pushes) == 10
+    assert sum(side(a) == 1 and side(b) == 0 for a, b in pushes) == 12
+    with pytest.raises(ValueError, match="ranks 0 to 8"):
+        pair_gather_roles(9)
+
+
+def test_island_gather_switch_covers_worlds_8_and_9(monkeypatch) -> None:
+    from b12x.comm.pcie import _dcp_a2a_cute as kernels
+
+    monkeypatch.delenv(kernels.GATHER_ISLAND_ENV, raising=False)
+    assert not any(kernels.gather_island_enabled(world) for world in (2, 4, 8, 9, 16))
+    monkeypatch.setenv(kernels.GATHER_ISLAND_ENV, "1")
+    assert [kernels.gather_island_enabled(world) for world in (2, 4, 8, 9, 10, 16)] == [
+        False, False, True, True, False, False]
+
+
 def test_block_pair_barrier_selects_once_and_keeps_scaled_offsets_int64() -> None:
     from b12x.comm.pcie import _dcp_cute_common as common
 

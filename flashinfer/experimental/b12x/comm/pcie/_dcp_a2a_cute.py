@@ -91,9 +91,49 @@ GATHER_ISLAND_ENV = "B12X_PCIE_DCP_GATHER_ISLAND"
 
 
 def gather_island_enabled(world_size: int | None = None) -> bool:
-    """Read the two-island gather switch (plan/compile time, default off; W==8 only)."""
+    """Read the island gather switch (plan/compile time, default off; worlds 8 and 9).
+
+    World 8 is two islands of four ranks. World 9 is four leaf pairs and one
+    single rank, (0,1), (2,3), (4,5), (6,7) and 8 (``pair_gather_roles``).
+    """
     on = os.environ.get(GATHER_ISLAND_ENV, "0").strip() not in ("", "0")
-    return on and (world_size is None or int(world_size) == 8)
+    return on and (world_size is None or int(world_size) in (8, 9))
+
+
+def pair_gather_roles(rank: int) -> dict:
+    """Peers of one rank in the nine-rank pair gather.
+
+    Topology contract: ranks 2i and 2i+1 share a leaf switch (i < 4) whose one
+    uplink carries everything that leaves the pair; rank 8 has a leaf of its
+    own. A flat push sends every segment to all eight peers, so 14 copies of a
+    segment leave each pair and 20 cross between ranks 0-3,8 and ranks 4-7. Here
+    a pair member pushes its segment to its partner, to the member of the same
+    parity in each other pair and to rank 8, and forwards what those same-parity
+    members (and rank 8, to one member per pair) pushed to it to its partner:
+    8 copies leave a pair, 7 enter it, 10 and 12 cross between the two sides.
+
+    Returns the ranks this rank pushes to (``direct``), the sources it forwards
+    to its partner (``forwarded``), the peers of its first barrier (``first``,
+    a symmetric relation) and its partner (None for rank 8).
+    """
+    if not 0 <= rank < 9:
+        raise ValueError("the pair gather is defined for ranks 0 to 8")
+    if rank == 8:
+        return dict(
+            direct=tuple(2 * pair + pair % 2 for pair in range(4)),
+            forwarded=(),
+            first=tuple(range(8)),
+            partner=None,
+        )
+    pair, member = divmod(rank, 2)
+    partner = rank ^ 1
+    same = tuple(2 * other + member for other in range(4) if other != pair)
+    return dict(
+        direct=(partner, *same, 8),
+        forwarded=same + ((8,) if member == pair % 2 else ()),
+        first=(partner, *same, 8),
+        partner=partner,
+    )
 
 
 def lse_push_tp8_enabled() -> bool:
@@ -1095,6 +1135,140 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
         )
 
     @cute.jit
+    def _gather_barrier(self, signals, lane_mask: int):
+        """Per-CTA barrier with the peers of ``lane_mask``, then visibility of their pushes."""
+        tidx, _, _ = cute.arch.thread_idx()
+        if cutlass.const_expr(getattr(self, "_gather_acquire", False)):
+            block_pair_barrier_acquire(
+                signals,
+                self_signal=signals[self._rank],
+                rank=self._rank,
+                world_size=self._world_size,
+                max_blocks=_MAX_BLOCKS,
+                lane_mask=lane_mask,
+            )
+        else:
+            block_pair_barrier(
+                signals,
+                self_signal=signals[self._rank],
+                rank=self._rank,
+                world_size=self._world_size,
+                max_blocks=_MAX_BLOCKS,
+                lane_mask=lane_mask,
+            )
+            if Int32(tidx) == Int32(0):
+                _membar_sys()
+            cute.arch.sync_threads()
+
+    @cute.jit
+    def _gather_pairs(
+        self,
+        local_input,
+        output,
+        staging,
+        signals,
+        batch,
+        local_packs,
+        tiles_per_rank,
+        warp_first,
+        warp_stride,
+        lane,
+    ):
+        """Nine ranks on four leaf pairs and a single rank (``pair_gather_roles``).
+
+        Same staging layout, tile-to-CTA mapping and output bytes as the flat
+        push. A segment enters a pair once and is forwarded inside it, so a CTA
+        forwards exactly the tiles its partner's CTA of the same index assembles.
+        """
+        roles = pair_gather_roles(self._rank)
+        direct, forwarded, partner = roles["direct"], roles["forwarded"], roles["partner"]
+        first_mask = 0
+        for peer in roles["first"]:
+            first_mask |= 1 << peer
+        tiles_per_batch = tiles_per_rank * Int32(self._world_size)
+        tiles = batch * tiles_per_batch
+        own_stage = self._staging_words(staging[self._rank])
+        peers = Int64(self._world_size - 1)
+        tile = warp_first
+        while tile < tiles:
+            batch_index = tile // tiles_per_batch
+            batch_tile = tile - batch_index * tiles_per_batch
+            source_rank = batch_tile // tiles_per_rank
+            rank_tile = batch_tile - source_rank * tiles_per_rank
+            pack = rank_tile * Int32(32) + lane
+            if source_rank == Int32(self._rank) and pack < local_packs:
+                source_pack = Int64(batch_index) * Int64(local_packs) + Int64(pack)
+                for peer in cutlass.range_constexpr(self._world_size):
+                    if cutlass.const_expr(peer in direct):
+                        staged_pack = (
+                            Int64(batch_index) * peers
+                            + Int64(self._rank if self._rank < peer else self._rank - 1)
+                        ) * Int64(local_packs) + Int64(pack)
+                        _copy_16b(
+                            local_input + source_pack * Int64(4),
+                            self._staging_words(staging[peer]) + staged_pack * Int64(4),
+                        )
+            tile += warp_stride
+        # The ranks that pushed to this one have pushed; rank 8 pairs with all.
+        self._gather_barrier(signals, first_mask)
+        if cutlass.const_expr(partner is not None):
+            partner_stage = self._staging_words(staging[partner])
+            tile = warp_first
+            while tile < tiles:
+                batch_index = tile // tiles_per_batch
+                batch_tile = tile - batch_index * tiles_per_batch
+                source_rank = batch_tile // tiles_per_rank
+                rank_tile = batch_tile - source_rank * tiles_per_rank
+                pack = rank_tile * Int32(32) + lane
+                if pack < local_packs:
+                    for source in cutlass.range_constexpr(self._world_size):
+                        if cutlass.const_expr(source in forwarded):
+                            if source_rank == Int32(source):
+                                mine_pack = (
+                                    Int64(batch_index) * peers
+                                    + Int64(source if source < self._rank else source - 1)
+                                ) * Int64(local_packs) + Int64(pack)
+                                staged_pack = (
+                                    Int64(batch_index) * peers
+                                    + Int64(source if source < partner else source - 1)
+                                ) * Int64(local_packs) + Int64(pack)
+                                _copy_16b(
+                                    own_stage + mine_pack * Int64(4),
+                                    partner_stage + staged_pack * Int64(4),
+                                )
+                tile += warp_stride
+            # The partner has forwarded what only it received.
+            self._gather_barrier(signals, 1 << partner)
+        tile = warp_first
+        while tile < tiles:
+            batch_index = tile // tiles_per_batch
+            batch_tile = tile - batch_index * tiles_per_batch
+            source_rank = batch_tile // tiles_per_rank
+            rank_tile = batch_tile - source_rank * tiles_per_rank
+            pack = rank_tile * Int32(32) + lane
+            if pack < local_packs:
+                source_pack = Int64(batch_index) * Int64(local_packs) + Int64(pack)
+                output_pack = (
+                    Int64(batch_index) * Int64(self._world_size) + Int64(source_rank)
+                ) * Int64(local_packs) + Int64(pack)
+                source_address = Int64((local_input + source_pack * Int64(4)).toint())
+                for source in cutlass.range_constexpr(self._world_size):
+                    if source_rank == Int32(source):
+                        if cutlass.const_expr(source != self._rank):
+                            staged_pack = (
+                                Int64(batch_index) * peers
+                                + Int64(source if source < self._rank else source - 1)
+                            ) * Int64(local_packs) + Int64(pack)
+                            source_address = Int64(
+                                (own_stage + staged_pack * Int64(4)).toint()
+                            )
+                _copy_16b_addr(
+                    source_address,
+                    Int64((output + output_pack * Int64(4)).toint()),
+                )
+            tile += warp_stride
+
+    @cute.jit
     def gather(
         self,
         local_input,
@@ -1216,7 +1390,22 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
                     )
                 tile += warp_stride
         else:
-            if cutlass.const_expr(getattr(self, "_gather_island", False)):
+            if cutlass.const_expr(
+                getattr(self, "_gather_island", False) and self._world_size == 9
+            ):
+                self._gather_pairs(
+                    local_input,
+                    output,
+                    staging,
+                    signals,
+                    batch,
+                    local_packs,
+                    tiles_per_rank,
+                    warp_first,
+                    warp_stride,
+                    lane,
+                )
+            elif cutlass.const_expr(getattr(self, "_gather_island", False)):
                 # Two-island topology (ranks [0, W/2) and [W/2, W) behind two PCIe
                 # switches whose uplinks are shared by the island): each segment
                 # crosses the uplink ONCE, to the partner rank (rank ^ W/2), which
@@ -2556,8 +2745,8 @@ def _get_compiled_all_gather_heads(
     island: bool = False,
 ) -> Callable:
     """Compile and retain one all-gather-heads launcher specialization."""
-    if island and int(world_size) != 8:
-        raise ValueError("two-island all_gather_heads requires world_size 8")
+    if island and int(world_size) not in (8, 9):
+        raise ValueError("island all_gather_heads requires world_size 8 or 9")
     launch = _AllGatherHeadsLaunch(
         world_size,
         rank,
