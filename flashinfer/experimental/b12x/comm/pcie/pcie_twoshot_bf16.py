@@ -376,7 +376,7 @@ class PCIeTwoShotBF16:
         transport = (
             state.query.call["transport"] if operation == "all_reduce" else "push"
         )
-        island = transport in ("island", "island_bf16")
+        island = transport in ("island", "island_bf16", "island_overlap")
         if operation == "all_gather":
             shard_packs = payload_packs
             total_packs = payload_packs * self.world_size
@@ -388,6 +388,17 @@ class PCIeTwoShotBF16:
             if self.world_size != 8 or total_packs % 4:
                 raise ValueError("island two-shot needs world size 8 and whole quarters")
             shard_packs = total_packs // 4
+        grid_packs = shard_packs
+        if transport == "island_overlap":
+            from ._twoshot_bf16_cute import (
+                _ISLAND_OVERLAP_STAGES,
+                island_overlap_fits,
+            )
+
+            if not island_overlap_fits(shard_packs, self._pack_stride):
+                raise ValueError("pcie_twoshot_bf16 staging capacity exceeded")
+            # The grid covers one pipeline sub-chunk of the quarter.
+            grid_packs = -(-shard_packs // _ISLAND_OVERLAP_STAGES)
         if (
             int(threads) != state.query.call["threads"]
             or int(block_limit) != state.query.call["block_limit"]
@@ -395,7 +406,7 @@ class PCIeTwoShotBF16:
             raise ValueError("two-shot launch controls differ from the prepared plan")
         if shard_packs > self._pack_stride * (2 if island else 1):
             raise ValueError("pcie_twoshot_bf16 staging capacity exceeded")
-        blocks = max(1, min(int(block_limit), (shard_packs + threads - 1) // threads))
+        blocks = max(1, min(int(block_limit), (grid_packs + threads - 1) // threads))
         capturing = _is_current_stream_capturing(self.device)
         if capturing and self._capture_context_depth <= 0:
             raise RuntimeError("PCIe twoshot-bf16 capture requires runtime.capture()")

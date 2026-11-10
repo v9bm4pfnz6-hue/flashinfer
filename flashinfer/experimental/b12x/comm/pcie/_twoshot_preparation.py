@@ -58,7 +58,7 @@ def _operation(surface: str) -> str:
     raise ValueError(f"unsupported two-shot preparation surface {surface!r}")
 
 
-ISLAND_TRANSPORTS = ("island", "island_bf16")
+ISLAND_TRANSPORTS = ("island", "island_bf16", "island_overlap")
 _ISLAND_ENV = "B12X_PCIE_TWOSHOT_ISLAND"
 _ISLAND_MIN_BYTES_ENV = "B12X_PCIE_TWOSHOT_ISLAND_MIN_BYTES"
 
@@ -96,13 +96,15 @@ def _island_transport(
     mode = os.environ.get(_ISLAND_ENV, "0").strip().lower()
     if mode in ("", "0", "off", "false") or transport not in ("push", "pull"):
         return transport
-    if mode not in ("1", "on", "true", "fp32", "bf16"):
-        raise ValueError(f"{_ISLAND_ENV} must be 0, 1, fp32 or bf16")
+    if mode not in ("1", "on", "true", "fp32", "bf16", "overlap"):
+        raise ValueError(f"{_ISLAND_ENV} must be 0, 1, fp32, bf16 or overlap")
     if surface != "PCIeTwoShotBF16.all_reduce":
         return transport
     minimum = int(os.environ.get(_ISLAND_MIN_BYTES_ENV, str(1 << 20)))
     if total_packs * 16 < minimum or not island_eligible(world_size, total_packs):
         return transport
+    if mode == "overlap":  # software-pipelined FP32 variant, same results
+        return "island_overlap"
     return "island_bf16" if mode == "bf16" else "island"
 
 
@@ -435,6 +437,7 @@ def compile_twoshot_surface(query_payload, ordinal: int):
                         int(call["row_elems"]),
                         int(ordinal),
                         call["transport"] == "island_bf16",
+                        call["transport"] == "island_overlap",
                     )
                 )
                 for device_slot, bias in call["device_slot_variants"]
