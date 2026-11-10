@@ -70,11 +70,13 @@ def _state_gather_acquire(state) -> bool:
     return bool(call is not None and call.get("gather_sync") == "acquire")
 
 
-def _state_gather_island(state) -> bool:
-    """Whether a prepared all_gather_heads plan uses the two-island transport."""
+def _state_gather_island(state):
+    """The island transport of a prepared all_gather_heads plan: False, True or a route design."""
+    from ._dcp_a2a_cute import gather_island_argument
+
     query = getattr(state, "query", None)
     call = getattr(query, "call", None)
-    return bool(call is not None and call.get("gather_topology") == "island")
+    return gather_island_argument(None if call is None else call.get("gather_topology"))
 
 
 def _env_int(name: str, fallback: int) -> int:

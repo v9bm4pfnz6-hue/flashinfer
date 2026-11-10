@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import os
 from collections.abc import Callable, Sequence
 
@@ -106,6 +107,28 @@ def gather_island_enabled(world_size: int | None = None) -> bool:
     return on and (world_size is None or int(world_size) in (8, 9))
 
 
+def gather_island_design(world_size: int | None = None):
+    """The island gather of a world: False, True, or the name of a world-9 route design.
+
+    The switch at 1 selects the two-island gather at world 8 and the pair gather at world 9
+    (True). At 2 it selects the side-entry gather at world 9 (``"side-entry"``,
+    ``side_entry_gather_roles``) and means the same as 1 at world 8.
+    """
+    if not gather_island_enabled(world_size):
+        return False
+    value = os.environ.get(GATHER_ISLAND_ENV, "0").strip()
+    if value == "2" and world_size is not None and int(world_size) == 9:
+        return "side-entry"
+    return True
+
+
+def gather_island_argument(topology):
+    """The ``island`` argument of the gather launchers for a plan's ``gather_topology``."""
+    if topology == "island":
+        return True
+    return topology if topology == "side-entry" else False
+
+
 def pair_gather_roles(rank: int) -> dict:
     """Peers of one rank in the nine-rank pair gather.
 
@@ -140,6 +163,83 @@ def pair_gather_roles(rank: int) -> dict:
         first=(partner, *same, 8),
         partner=partner,
     )
+
+
+# The rank on the other side that receives each rank's segment in the side-entry gather: of all
+# assignments, the one with the fewest copies on the busiest link and then the smallest sum of the
+# three phases' busiest links.
+SIDE_ENTRY_RANKS = (5, 4, 6, 7, 8, 2, 8, 1, 7)
+
+
+@functools.cache
+def _side_entry_phases() -> tuple:
+    """Every ``(sender, source, child)`` of the side-entry gather, by phase."""
+    leaves = ((0, 1), (2, 3), (4, 5), (6, 7), (8,))
+    sides = ((8, 0, 1, 2, 3), (4, 5, 6, 7))
+    leaf_of = {rank: index for index, members in enumerate(leaves) for rank in members}
+    phases = ([], [], [])
+    for source in range(9):
+        mine, other = sides if source in sides[0] else sides[::-1]
+
+        def spread(origin, ranks):
+            # The partner of `origin` and one member of each other leaf among `ranks`.
+            targets = []
+            for index, members in enumerate(leaves):
+                here = [rank for rank in members if rank in ranks]
+                if index == leaf_of[origin]:
+                    targets += [rank for rank in here if rank != origin]
+                elif here:
+                    targets.append(here[(source + index) % len(here)])
+            return targets
+
+        entry = SIDE_ENTRY_RANKS[source]
+        for target in (*spread(source, mine), entry):
+            phases[0].append((source, source, target))
+        for sender, targets, phase in (
+            (source, spread(source, mine), 1),
+            (entry, spread(entry, other), 2),
+        ):
+            for target in targets:
+                if sender == entry:
+                    phases[1].append((entry, source, target))
+                if leaf_of[target] != leaf_of[sender]:
+                    for partner in leaves[leaf_of[target]]:
+                        if partner != target:
+                            phases[phase].append((target, source, partner))
+    return tuple(tuple(phase) for phase in phases)
+
+
+def side_entry_gather_roles(rank: int) -> tuple:
+    """Pushes and barrier peers of one rank in the nine-rank side-entry gather.
+
+    Topology contract: that of ``pair_gather_roles``, with ranks 0-3 and 8 on one side of a
+    single link and ranks 4-7 on the other. In the pair gather 10 and 12 copies of every
+    segment cross that link. Here a segment crosses it once. First its rank pushes it to its
+    partner, to one member of each other leaf of its side and to one rank of the other side
+    (``SIDE_ENTRY_RANKS``). Second, the members that received it forward it to their partners,
+    and the entry rank forwards it to its partner and to one member of each other leaf of its
+    side. Third, those members forward it to their partners.
+
+    Returns one ``(pushes, mask)`` per phase. ``pushes`` holds ``(source, child)`` for every
+    segment this rank writes into the staging of ``child`` in that phase: its own input when
+    it is the source, otherwise what an earlier phase left in its staging. ``mask`` has the
+    bits of the ranks that push to this rank or receive from it in that phase, a symmetric
+    relation, so the ranks of every pair pass the same barriers.
+    """
+    if not 0 <= rank < 9:
+        raise ValueError("the side-entry gather is defined for ranks 0 to 8")
+    roles = []
+    for phase in _side_entry_phases():
+        mask = 0
+        for sender, _, child in phase:
+            if sender == rank:
+                mask |= 1 << child
+            if child == rank:
+                mask |= 1 << sender
+        roles.append(
+            (tuple((source, child) for sender, source, child in phase if sender == rank), mask)
+        )
+    return tuple(roles)
 
 
 def lse_push_tp8_enabled() -> bool:
@@ -1167,6 +1267,159 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
             cute.arch.sync_threads()
 
     @cute.jit
+    def _gather_forward(
+        self,
+        pushes,
+        local_input,
+        staging,
+        batch,
+        local_packs,
+        tiles_per_rank,
+        warp_first,
+        warp_stride,
+        lane,
+    ):
+        """Write this CTA's tiles of every ``(source, child)`` of ``pushes`` into the child's staging."""
+        tiles_per_batch = tiles_per_rank * Int32(self._world_size)
+        tiles = batch * tiles_per_batch
+        own_stage = self._staging_words(staging[self._rank])
+        peers = Int64(self._world_size - 1)
+        tile = warp_first
+        while tile < tiles:
+            batch_index = tile // tiles_per_batch
+            batch_tile = tile - batch_index * tiles_per_batch
+            source_rank = batch_tile // tiles_per_rank
+            rank_tile = batch_tile - source_rank * tiles_per_rank
+            pack = rank_tile * Int32(32) + lane
+            if pack < local_packs:
+                for source in cutlass.range_constexpr(self._world_size):
+                    for child in cutlass.range_constexpr(self._world_size):
+                        if cutlass.const_expr((source, child) in pushes):
+                            if source_rank == Int32(source):
+                                staged_pack = (
+                                    Int64(batch_index) * peers
+                                    + Int64(source if source < child else source - 1)
+                                ) * Int64(local_packs) + Int64(pack)
+                                if cutlass.const_expr(source == self._rank):
+                                    source_pack = Int64(batch_index) * Int64(
+                                        local_packs
+                                    ) + Int64(pack)
+                                    _copy_16b(
+                                        local_input + source_pack * Int64(4),
+                                        self._staging_words(staging[child])
+                                        + staged_pack * Int64(4),
+                                    )
+                                else:
+                                    mine_pack = (
+                                        Int64(batch_index) * peers
+                                        + Int64(
+                                            source if source < self._rank else source - 1
+                                        )
+                                    ) * Int64(local_packs) + Int64(pack)
+                                    _copy_16b(
+                                        own_stage + mine_pack * Int64(4),
+                                        self._staging_words(staging[child])
+                                        + staged_pack * Int64(4),
+                                    )
+            tile += warp_stride
+
+    @cute.jit
+    def _gather_side_entry(
+        self,
+        local_input,
+        output,
+        staging,
+        signals,
+        batch,
+        local_packs,
+        tiles_per_rank,
+        warp_first,
+        warp_stride,
+        lane,
+    ):
+        """Nine ranks on two sides of one link (``side_entry_gather_roles``).
+
+        Same staging layout, tile-to-CTA mapping and output bytes as the flat push. A segment
+        crosses between the sides once and reaches the ranks of the other side in two more
+        phases; a CTA forwards exactly the tiles the receiving rank's CTA of the same index
+        assembles or forwards, and every phase ends in a barrier with the ranks it exchanged
+        tiles with.
+        """
+        first, second, third = side_entry_gather_roles(self._rank)
+        self._gather_forward(
+            first[0],
+            local_input,
+            staging,
+            batch,
+            local_packs,
+            tiles_per_rank,
+            warp_first,
+            warp_stride,
+            lane,
+        )
+        self._gather_barrier(signals, first[1])
+        if cutlass.const_expr(len(second[0]) > 0):
+            self._gather_forward(
+                second[0],
+                local_input,
+                staging,
+                batch,
+                local_packs,
+                tiles_per_rank,
+                warp_first,
+                warp_stride,
+                lane,
+            )
+        if cutlass.const_expr(second[1] != 0):
+            self._gather_barrier(signals, second[1])
+        if cutlass.const_expr(len(third[0]) > 0):
+            self._gather_forward(
+                third[0],
+                local_input,
+                staging,
+                batch,
+                local_packs,
+                tiles_per_rank,
+                warp_first,
+                warp_stride,
+                lane,
+            )
+        if cutlass.const_expr(third[1] != 0):
+            self._gather_barrier(signals, third[1])
+        tiles_per_batch = tiles_per_rank * Int32(self._world_size)
+        tiles = batch * tiles_per_batch
+        own_stage = self._staging_words(staging[self._rank])
+        peers = Int64(self._world_size - 1)
+        tile = warp_first
+        while tile < tiles:
+            batch_index = tile // tiles_per_batch
+            batch_tile = tile - batch_index * tiles_per_batch
+            source_rank = batch_tile // tiles_per_rank
+            rank_tile = batch_tile - source_rank * tiles_per_rank
+            pack = rank_tile * Int32(32) + lane
+            if pack < local_packs:
+                source_pack = Int64(batch_index) * Int64(local_packs) + Int64(pack)
+                output_pack = (
+                    Int64(batch_index) * Int64(self._world_size) + Int64(source_rank)
+                ) * Int64(local_packs) + Int64(pack)
+                source_address = Int64((local_input + source_pack * Int64(4)).toint())
+                for source in cutlass.range_constexpr(self._world_size):
+                    if source_rank == Int32(source):
+                        if cutlass.const_expr(source != self._rank):
+                            staged_pack = (
+                                Int64(batch_index) * peers
+                                + Int64(source if source < self._rank else source - 1)
+                            ) * Int64(local_packs) + Int64(pack)
+                            source_address = Int64(
+                                (own_stage + staged_pack * Int64(4)).toint()
+                            )
+                _copy_16b_addr(
+                    source_address,
+                    Int64((output + output_pack * Int64(4)).toint()),
+                )
+            tile += warp_stride
+
+    @cute.jit
     def _gather_pairs(
         self,
         local_input,
@@ -1397,6 +1650,22 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
                 tile += warp_stride
         else:
             if cutlass.const_expr(
+                getattr(self, "_gather_routes", None) == "side-entry"
+                and self._world_size == 9
+            ):
+                self._gather_side_entry(
+                    local_input,
+                    output,
+                    staging,
+                    signals,
+                    batch,
+                    local_packs,
+                    tiles_per_rank,
+                    warp_first,
+                    warp_stride,
+                    lane,
+                )
+            elif cutlass.const_expr(
                 getattr(self, "_gather_island", False) and self._world_size == 9
             ):
                 self._gather_pairs(
@@ -2750,6 +3019,9 @@ def _gather_launcher_key(
         bool(device_slot_selection),
     )
     key = key + ("acquire",) if acquire else key
+    if isinstance(island, str):
+        # A named world-9 route design.
+        return key + ("island", island)
     return key + ("island",) if island else key
 
 
@@ -2768,7 +3040,7 @@ def is_all_gather_heads_prepared(
             threads,
             device_slot_selection,
             gather_acquire_enabled() if acquire is None else acquire,
-            gather_island_enabled(world_size) if island is None else island,
+            gather_island_design(world_size) if island is None else island,
         )
         in _PREPARED_GATHER_LAUNCHERS
     )
@@ -2786,6 +3058,8 @@ def _get_compiled_all_gather_heads(
     """Compile and retain one all-gather-heads launcher specialization."""
     if island and int(world_size) not in (8, 9):
         raise ValueError("island all_gather_heads requires world_size 8 or 9")
+    if isinstance(island, str) and (island != "side-entry" or int(world_size) != 9):
+        raise ValueError("the side-entry gather is the one named route design, for world_size 9")
     launch = _AllGatherHeadsLaunch(
         world_size,
         rank,
@@ -2796,6 +3070,8 @@ def _get_compiled_all_gather_heads(
         launch._gather_acquire = True
     if island:
         launch._gather_island = True
+    if isinstance(island, str):
+        launch._gather_routes = island
     key = _gather_launcher_key(
         world_size, rank, threads, device_slot_selection, acquire, island
     )
@@ -2825,7 +3101,8 @@ def _get_compiled_all_gather_heads(
                 "device_slot_selection",
             )
             + (("sync",) if acquire else ())
-            + (("topology",) if island else ()),
+            + (("topology",) if island else ())
+            + (("routes",) if isinstance(island, str) else ()),
         ),
     )
 
@@ -3148,7 +3425,7 @@ def all_gather_heads(
     slot_delta_256b = _slot_delta_256b(slot_delta_bytes)
     if launcher is None:
         acquire = gather_acquire_enabled()
-        island = gather_island_enabled(world_size)
+        island = gather_island_design(world_size)
         launcher = _get_compiled_all_gather_heads(
             world_size,
             rank,

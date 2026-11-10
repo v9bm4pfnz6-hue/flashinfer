@@ -500,6 +500,81 @@ def test_pair_gather_roles_deliver_every_segment_with_symmetric_barriers() -> No
         pair_gather_roles(9)
 
 
+def test_side_entry_gather_roles_deliver_every_segment_with_one_crossing() -> None:
+    """Emulate the nine-rank side-entry gather phase by phase and count the copies on every link."""
+    import collections
+
+    from b12x.comm.pcie._dcp_a2a_cute import SIDE_ENTRY_RANKS, side_entry_gather_roles
+
+    roles = {rank: side_entry_gather_roles(rank) for rank in range(9)}
+    assert all(len(role) == 3 for role in roles.values())
+    side = lambda rank: 1 if 4 <= rank < 8 else 0
+    leaf = lambda rank: 4 if rank == 8 else rank // 2
+    held = {rank: {rank} for rank in range(9)}
+    crossings = collections.Counter()
+    total, busiest = collections.Counter(), []
+    for phase in range(3):
+        arrived = []
+        load = collections.Counter()
+        for rank, role in roles.items():
+            pushes, mask = role[phase]
+            # Symmetric barriers: a peer of this phase names this rank in the same phase.
+            assert all(roles[peer][phase][1] >> rank & 1 for peer in range(9) if mask >> peer & 1)
+            assert mask == sum(1 << peer for peer in {child for _, child in pushes}
+                               | {sender for sender in range(9) if any(
+                                   child == rank for _, child in roles[sender][phase][0])})
+            for source, child in pushes:
+                # A rank pushes its own segment first and forwards only what an earlier phase delivered.
+                assert source in held[rank] and child != rank
+                assert (source == rank) == (phase == 0)
+                arrived.append((child, source))
+                crossings[source] += side(rank) != side(child)
+                links = [("up", rank), ("down", child)]
+                if leaf(rank) != leaf(child):
+                    links += [("leaf-up", leaf(rank))] * (rank != 8) + [("leaf-down", leaf(child))] * (child != 8)
+                    if side(rank) != side(child):
+                        links.append(("cross", side(rank)))
+                for link in links:
+                    load[link] += 1
+                    total[link] += 1
+        for child, source in arrived:
+            # Every segment reaches a rank once.
+            assert source not in held[child]
+            held[child].add(source)
+        busiest.append(max(load.values()))
+    assert all(held[rank] == set(range(9)) for rank in range(9))
+    # One copy of every segment crosses between ranks 0-3,8 and ranks 4-7, where the pair gather sends 10 and 12.
+    assert all(crossings[source] == 1 for source in range(9))
+    assert total[("cross", 0)] == 5 and total[("cross", 1)] == 4
+    assert all(side(SIDE_ENTRY_RANKS[source]) != side(source) for source in range(9))
+    # Copies on the busiest link of each phase, and on the busiest link over the whole gather.
+    assert busiest == [6, 5, 2] and max(total.values()) == 9
+    with pytest.raises(ValueError, match="ranks 0 to 8"):
+        side_entry_gather_roles(9)
+
+
+def test_side_entry_gather_switch_names_a_world_9_design_and_its_launcher(monkeypatch) -> None:
+    from b12x.comm.pcie import _dcp_a2a_cute as kernels
+
+    monkeypatch.delenv(kernels.GATHER_ISLAND_ENV, raising=False)
+    assert kernels.gather_island_design(9) is False
+    monkeypatch.setenv(kernels.GATHER_ISLAND_ENV, "1")
+    assert kernels.gather_island_design(8) is True and kernels.gather_island_design(9) is True
+    monkeypatch.setenv(kernels.GATHER_ISLAND_ENV, "2")
+    assert kernels.gather_island_design(8) is True and kernels.gather_island_design(9) == "side-entry"
+    assert kernels.gather_island_design(16) is False
+    assert [kernels.gather_island_argument(value) for value in (None, "island", "side-entry", "other")] == [
+        False, True, "side-entry", False]
+    plain = kernels._gather_launcher_key(9, 3, 256, True)
+    pairs = kernels._gather_launcher_key(9, 3, 256, True, False, True)
+    routed = kernels._gather_launcher_key(9, 3, 256, True, False, "side-entry")
+    assert pairs == plain + ("island",) and routed == plain + ("island", "side-entry")
+    assert kernels._gather_launcher_key(9, 3, 256, True, True, "side-entry") == plain + (
+        "acquire", "island", "side-entry")
+    with pytest.raises(ValueError, match="world_size 9"):
+        kernels._get_compiled_all_gather_heads.__wrapped__(8, 0, 256, True, False, "side-entry")
+
+
 def test_island_gather_switch_covers_worlds_8_and_9(monkeypatch) -> None:
     from b12x.comm.pcie import _dcp_a2a_cute as kernels
 
