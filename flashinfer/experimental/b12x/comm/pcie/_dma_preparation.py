@@ -149,6 +149,37 @@ def query_from_metadata(
     )
 
 
+def gather_query_from_metadata(
+    runtime, *, shape: tuple[int, ...], dtype: torch.dtype
+) -> PcieQuery:
+    """Snapshot a ring all-gather of one `shape` segment per rank on a DMA channel.
+
+    The gather runs the channel's copy and flag programs, so its plan compiles what a reduction's
+    plan compiles; the operation and the segment are part of the query, not of the code.
+    """
+    if not shape or any(type(extent) is not int or extent <= 0 for extent in shape):
+        raise ValueError("DMA gather metadata requires a positive shape")
+    count = 1
+    for extent in shape:
+        count *= extent
+    nbytes = count * dtype.itemsize
+    if nbytes % 16 or nbytes > int(runtime.gather_capacity):
+        raise ValueError(
+            "DMA gather segments are whole 16-byte packs within the ring's shard capacity"
+        )
+    return query_from_runtime(
+        runtime,
+        surface=_SURFACE,
+        call=FrozenMapping(
+            {
+                "operation": "all_gather",
+                "shape": tuple(shape),
+                "dtype": str(dtype).removeprefix("torch."),
+            }
+        ),
+    )
+
+
 @program_cache(scope="preparation")
 def compile_dma_surface(query_payload, ordinal: int) -> DmaLaunchers:
     """Compiler-pool factory using only query metadata and native factories."""
@@ -190,6 +221,16 @@ class _DmaExecutionState:
 
     def run(self, inp, *, out=None):
         return self.runtime._run_prepared(inp, out=out, state=self)
+
+    def run_gather(self, slots):
+        """Ring all-gather into the runtime's gather_slots view; release_gather ends it."""
+        self.require_runtime(self.runtime)
+        torch.cuda.set_device(self.runtime.device)
+        self.runtime._run_gather(self.runtime._gather_segment_bytes(slots))
+        return slots
+
+    def release_gather(self) -> None:
+        self.runtime._release_gather()
 
     def prime(self, inp, *, out) -> None:
         """Prime the actual caller-owned collective transport after loading code."""
@@ -285,4 +326,4 @@ def plan(
     )
 
 
-__all__ = ["plan", "prepared_call", "query_from_runtime"]
+__all__ = ["gather_query_from_metadata", "plan", "prepared_call", "query_from_runtime"]

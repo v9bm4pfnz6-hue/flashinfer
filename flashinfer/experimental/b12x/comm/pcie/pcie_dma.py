@@ -53,6 +53,9 @@ TREE_PIECES = (1, 2, 4)
 TREE_BANK_SLOTS = 128
 TREE_BANK_SENDS = 256
 TREE_MIN_PIECE_BYTES = 256 << 10
+# Pieces a ring all-gather splits a segment into. One keeps every link busy: a hop of a segment
+# starts when the hop before it arrived, and the hops of the other segments fill the same time.
+GATHER_PIECES = 1
 
 # Per-shape ring pieces for prefill reductions at world 8, measured on an 8-GPU
 # two-switch PCIe box (every shape in
@@ -1090,6 +1093,168 @@ class PCIeDmaAllReduce:
             self._flag_ptr(rank, done), self._counter_ptr(self._wait_counters, done)
         )
         return out
+
+    @property
+    def gather_capacity(self) -> int:
+        """Bytes of one rank's segment that the ring all-gather carries; zero on a tree channel."""
+
+        return 0 if self._tree is not None else int(self.shard_capacity)
+
+    def gather_slots(self, shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+        """This rank's view of an all-gather of one `shape` segment per rank.
+
+        The result is `[world, *shape]` over the channel's scratch. Slot `s` holds the segment
+        of rank `gather_rank(s)`, which is `(rank + 1 + s) % world`: the ranks in ring order
+        from this rank's successor, so the last slot is this rank's own segment. The caller
+        writes that slot, runs `all_gather`, reads every slot and then calls `release_gather`.
+        Until the release no reduction or gather may start on the channel.
+        """
+
+        elements = 1
+        for extent in shape:
+            if type(extent) is not int or extent <= 0:
+                raise ValueError("an all-gather segment has a positive shape")
+            elements *= extent
+        itemsize = int(dtype.itemsize)
+        if (
+            self._closed
+            or self._tree is not None
+            or elements * itemsize > self.shard_capacity
+            or elements * itemsize % 16
+            or self.shard_capacity % itemsize
+        ):
+            raise ValueError(
+                "an all-gather segment is a whole number of 16-byte packs within the "
+                "ring channel's shard capacity"
+            )
+        stride = self.shard_capacity // itemsize
+        flat = _device_view(
+            self._scratch_ptr(self.rank, 0),
+            (self.world_size - 1) * stride + elements,
+            dtype,
+            self.device,
+        )
+        inner, step = [], 1
+        for extent in reversed(shape):
+            inner.append(step)
+            step *= extent
+        return torch.as_strided(
+            flat, (self.world_size, *shape), (stride, *reversed(inner))
+        )
+
+    def gather_rank(self, slot: int) -> int:
+        """The rank whose segment `gather_slots` holds in `slot`."""
+
+        return (self.rank + 1 + int(slot)) % self.world_size
+
+    def all_gather(self, slots: torch.Tensor, *, plan: Plan) -> torch.Tensor:
+        """Fill `slots`, a `gather_slots` view whose last slot the caller wrote."""
+
+        state = require_prepared(plan, "comm.pcie", self.device)
+        if not hasattr(state, "require_runtime") or not hasattr(state, "run_gather"):
+            raise TypeError("plan does not contain a prepared DMA channel")
+        state.require_runtime(self)
+        return state.run_gather(slots)
+
+    def release_gather(self, *, plan: Plan) -> None:
+        """Let the neighbours reuse this rank's scratch: the gathered slots are dead afterwards."""
+
+        state = require_prepared(plan, "comm.pcie", self.device)
+        if not hasattr(state, "require_runtime") or not hasattr(state, "release_gather"):
+            raise TypeError("plan does not contain a prepared DMA channel")
+        state.require_runtime(self)
+        state.release_gather()
+
+    def _gather_segment_bytes(self, slots: torch.Tensor) -> int:
+        if (
+            slots.ndim < 2
+            or slots.shape[0] != self.world_size
+            or slots.device != self.device
+            or slots.data_ptr() != self._scratch_ptr(self.rank, 0)
+            or slots.stride(0) * slots.element_size() != self.shard_capacity
+        ):
+            raise ValueError("all_gather takes the view gather_slots returned")
+        nbytes = slots[0].numel() * slots.element_size()
+        if nbytes <= 0 or nbytes > self.shard_capacity or nbytes % 16:
+            raise ValueError("all_gather segment does not fit the channel")
+        return nbytes
+
+    def _run_gather(self, nbytes: int, *, pieces: Optional[int] = None) -> None:
+        """Ring all-gather of the first `nbytes` of every rank's last scratch slot.
+
+        Scratch slot `s` of a rank is the home of rank `(rank + 1 + s) % world`'s segment. At
+        hop `j` every rank copies its slot `world - 1 - j` into the next rank's slot
+        `world - 2 - j`: its own segment first, then what the previous rank delivered one hop
+        earlier. After `world - 1` hops every slot is filled, and every link direction has
+        carried one copy at a time for the whole gather. A hop of a piece starts when that
+        piece arrived, which the previous rank's flag announces. Bytes are copied, never
+        converted. The closing handshake of a reduction is left to `_release_gather`, so the
+        caller reads its slots before a neighbour may write them again.
+        """
+
+        if self._tree is not None or self._closed:
+            raise ValueError("the ring all-gather needs an open ring channel")
+        world, rank = self.world_size, self.rank
+        nxt = (rank + 1) % world
+        pieces = GATHER_PIECES if pieces is None else int(pieces)
+        if (
+            pieces not in (1, 2, 4, 8)
+            or nbytes <= 0
+            or nbytes > self.shard_capacity
+            or nbytes % (16 * pieces)
+        ):
+            raise ValueError(
+                "ring all-gather pieces are whole 16-byte packs of a segment within the "
+                "shard capacity"
+            )
+        piece_bytes = nbytes // pieces
+        kernels = self._kernels
+        main = torch.cuda.current_stream(self.device)
+        copy_stream, flag_stream = self._copy_stream, self._flag_stream
+        arrived, copied = self._piece_events, self._copied_events
+        self._input_ready.record(main)
+        copy_stream.wait_event(self._input_ready)
+        flag_stream.wait_event(self._input_ready)
+        for hop in range(world - 1):
+            source = self._scratch_ptr(rank, world - 1 - hop)
+            target = self._scratch_ptr(nxt, world - 2 - hop)
+            for piece in range(pieces):
+                slot = hop * pieces + piece
+                with torch.cuda.stream(copy_stream):
+                    if hop:
+                        copy_stream.wait_event(arrived[piece])
+                    kernels.dma_copy(
+                        target + piece * piece_bytes,
+                        source + piece * piece_bytes,
+                        piece_bytes,
+                    )
+                    copied[slot].record(copy_stream)
+                with torch.cuda.stream(flag_stream):
+                    flag_stream.wait_event(copied[slot])
+                    kernels.dma_set_flag(
+                        self._flag_ptr(nxt, slot),
+                        self._counter_ptr(self._send_counters, slot),
+                    )
+                kernels.dma_wait_flag(
+                    self._flag_ptr(rank, slot),
+                    self._counter_ptr(self._wait_counters, slot),
+                )
+                arrived[piece].record(main)
+        main.wait_stream(copy_stream)
+        main.wait_stream(flag_stream)
+
+    def _release_gather(self) -> None:
+        """A reduction's closing handshake: this rank is done with its scratch, and waits for its successor."""
+
+        world, rank = self.world_size, self.rank
+        done = FLAG_SLOTS - 2
+        self._kernels.dma_set_flag(
+            self._flag_ptr((rank - 1) % world, done),
+            self._counter_ptr(self._send_counters, done),
+        )
+        self._kernels.dma_wait_flag(
+            self._flag_ptr(rank, done), self._counter_ptr(self._wait_counters, done)
+        )
 
     @property
     def tree(self) -> Optional[str]:
