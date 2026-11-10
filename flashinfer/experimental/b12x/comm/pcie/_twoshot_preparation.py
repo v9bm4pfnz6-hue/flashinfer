@@ -58,13 +58,52 @@ def _operation(surface: str) -> str:
     raise ValueError(f"unsupported two-shot preparation surface {surface!r}")
 
 
+ISLAND_TRANSPORTS = ("island", "island_bf16")
+_ISLAND_ENV = "B12X_PCIE_TWOSHOT_ISLAND"
+_ISLAND_MIN_BYTES_ENV = "B12X_PCIE_TWOSHOT_ISLAND_MIN_BYTES"
+
+
 def _transport(surface: str, transport: object) -> str:
     """Validate the all-reduce transport; every other operation pushes."""
-    if transport not in ("push", "pull"):
-        raise ValueError("two-shot transport must be push or pull")
-    if transport == "pull" and surface != "PCIeTwoShotBF16.all_reduce":
-        raise ValueError("only the BF16 two-shot all-reduce has a pull transport")
+    if transport not in ("push", "pull", *ISLAND_TRANSPORTS):
+        raise ValueError("two-shot transport must be push, pull or island")
+    if transport != "push" and surface != "PCIeTwoShotBF16.all_reduce":
+        raise ValueError(
+            "only the BF16 two-shot all-reduce has pull and island transports"
+        )
     return transport
+
+
+def island_eligible(world_size: int, total_packs: int) -> bool:
+    """2-island hierarchical all-reduce: world 8 (islands = ranks 0-3 / 4-7,
+    partner = rank ^ 4) and whole quarters of 16-byte packs."""
+    return int(world_size) == 8 and total_packs > 0 and total_packs % 4 == 0
+
+
+def _island_transport(
+    surface: str, transport: str, world_size: int, total_packs: int
+) -> str:
+    """Opt-in remap of BF16 push/pull all-reduce to the island transport.
+
+    ``B12X_PCIE_TWOSHOT_ISLAND`` = ``1``/``fp32`` (FP32 island partials on the
+    uplink, single rounding) or ``bf16`` (BF16 partials, one extra rounding);
+    unset/``0`` keeps the flat transports. Only payloads of at least
+    ``B12X_PCIE_TWOSHOT_ISLAND_MIN_BYTES`` (default 1 MiB) are remapped, so
+    decode-sized two-shot calls stay flat.
+    """
+    import os
+
+    mode = os.environ.get(_ISLAND_ENV, "0").strip().lower()
+    if mode in ("", "0", "off", "false") or transport not in ("push", "pull"):
+        return transport
+    if mode not in ("1", "on", "true", "fp32", "bf16"):
+        raise ValueError(f"{_ISLAND_ENV} must be 0, 1, fp32 or bf16")
+    if surface != "PCIeTwoShotBF16.all_reduce":
+        return transport
+    minimum = int(os.environ.get(_ISLAND_MIN_BYTES_ENV, str(1 << 20)))
+    if total_packs * 16 < minimum or not island_eligible(world_size, total_packs):
+        return transport
+    return "island_bf16" if mode == "bf16" else "island"
 
 
 def _push_shard_nbytes(runtime, surface: str, transport: str) -> int:
@@ -175,6 +214,13 @@ def query_from_runtime(runtime, *, surface: str, call) -> PcieQuery:
         dtype, scale_dtype = "bfloat16", None
         scale_shape, scale_stride, scale_alignment = None, None, None
     transport = _transport(surface, values.get("transport", "push"))
+    transport = _island_transport(
+        surface, transport, runtime.world_size, payload.numel() // 8
+    )
+    if transport in ISLAND_TRANSPORTS and not island_eligible(
+        runtime.world_size, payload.numel() // 8
+    ):
+        raise ValueError("island two-shot needs world size 8 and whole pack quarters")
     threads = int(values.get("threads", 512))
     block_limit = int(values.get("block_limit", 64))
     if threads <= 0 or threads > 512 or threads % 32:
@@ -278,6 +324,11 @@ def query_from_metadata(
         raise ValueError("two-shot metadata requires contiguous payload layout")
     if alignment < 16 or alignment & (alignment - 1):
         raise ValueError("two-shot metadata alignment must be a power of two >= 16")
+    transport = _island_transport(surface, transport, runtime.world_size, count // 8)
+    if transport in ISLAND_TRANSPORTS and not island_eligible(
+        runtime.world_size, count // 8
+    ):
+        raise ValueError("island two-shot needs world size 8 and whole pack quarters")
     rows = (count + int(runtime.row_elems) - 1) // int(runtime.row_elems)
     call_metadata = FrozenMapping(
         {
@@ -369,6 +420,25 @@ def compile_twoshot_surface(query_payload, ordinal: int):
             get_twoshot_bf16_launcher,
         )
 
+        if call["transport"] in ISLAND_TRANSPORTS:
+            from ._twoshot_bf16_cute import get_twoshot_bf16_island_launcher
+
+            # One launch: island reduce-scatter, partner exchange, island gather.
+            return {
+                ("all_reduce", bool(device_slot), int(bias)): (
+                    get_twoshot_bf16_island_launcher(
+                        query.world_size,
+                        query.rank,
+                        bool(device_slot),
+                        int(bias),
+                        int(call["threads"]),
+                        int(call["row_elems"]),
+                        int(ordinal),
+                        call["transport"] == "island_bf16",
+                    )
+                )
+                for device_slot, bias in call["device_slot_variants"]
+            }
         if call["transport"] == "pull":
             # One launch stages locally, then reads peer slabs for the reduction
             # and for the reduced shards.

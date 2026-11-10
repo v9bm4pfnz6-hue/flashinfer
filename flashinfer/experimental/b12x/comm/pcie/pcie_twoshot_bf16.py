@@ -373,18 +373,27 @@ class PCIeTwoShotBF16:
         del scale
         operation = state.query.call["operation"]
         payload_packs = payload.numel() // _PACK_ELEMS
+        transport = (
+            state.query.call["transport"] if operation == "all_reduce" else "push"
+        )
+        island = transport in ("island", "island_bf16")
         if operation == "all_gather":
             shard_packs = payload_packs
             total_packs = payload_packs * self.world_size
         else:
             total_packs = payload_packs
             shard_packs = (total_packs + self.world_size - 1) // self.world_size
+        if island:
+            # Quarter per island-local owner; regions are 2 * pack_stride packs.
+            if self.world_size != 8 or total_packs % 4:
+                raise ValueError("island two-shot needs world size 8 and whole quarters")
+            shard_packs = total_packs // 4
         if (
             int(threads) != state.query.call["threads"]
             or int(block_limit) != state.query.call["block_limit"]
         ):
             raise ValueError("two-shot launch controls differ from the prepared plan")
-        if shard_packs > self._pack_stride:
+        if shard_packs > self._pack_stride * (2 if island else 1):
             raise ValueError("pcie_twoshot_bf16 staging capacity exceeded")
         blocks = max(1, min(int(block_limit), (shard_packs + threads - 1) // threads))
         capturing = _is_current_stream_capturing(self.device)
@@ -394,8 +403,8 @@ class PCIeTwoShotBF16:
             self._device_slot_bias = self._slot & 1
             self._device_slot_selection = True
         # Each native launch consumes one slot and one graph epoch.
-        pull = operation == "all_reduce" and state.query.call["transport"] == "pull"
-        if pull:
+        pull = operation == "all_reduce" and transport == "pull"
+        if pull or island:
             steps = (("all_reduce", payload, out),)
         elif operation == "all_reduce":
             shard = self._push_shard[: shard_packs * _PACK_ELEMS]
