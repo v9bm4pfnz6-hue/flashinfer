@@ -744,6 +744,133 @@ class _AddLaunch:
                 )
 
 
+_TREE_BF16_SOURCES = 9
+_TREE_FP32_SOURCES = 2
+
+
+class _TreeAccumLaunch:
+    """FP32 sum of BF16 pieces and FP32 partials in argument order; one store.
+
+    The first BF16 source starts each accumulator; every further BF16 value and
+    then every FP32 partial is added to it in sequence. The sum is stored as
+    FP32 (a combiner's partial) or rounded once to BF16 (an owner's result).
+    """
+
+    def __init__(self, bf16_sources: int, fp32_sources: int, store_bf16: bool) -> None:
+        if not 1 <= bf16_sources <= _TREE_BF16_SOURCES or not 0 <= fp32_sources <= _TREE_FP32_SOURCES:
+            raise ValueError("tree accumulate takes 1..9 BF16 sources and 0..2 FP32 partials")
+        self._bf16_sources = int(bf16_sources)
+        self._fp32_sources = int(fp32_sources)
+        self._store_bf16 = bool(store_bf16)
+
+    @cute.jit
+    def __call__(
+        self,
+        dst_ptr: cute.Pointer,
+        b0: cute.Pointer,
+        b1: cute.Pointer,
+        b2: cute.Pointer,
+        b3: cute.Pointer,
+        b4: cute.Pointer,
+        b5: cute.Pointer,
+        b6: cute.Pointer,
+        b7: cute.Pointer,
+        b8: cute.Pointer,
+        f0: cute.Pointer,
+        f1: cute.Pointer,
+        packs: Int64,
+        grid_x: Int32,
+        stream: cuda.CUstream,
+    ) -> None:
+        self.kernel(
+            _one_tensor(dst_ptr),
+            _one_tensor(b0),
+            _one_tensor(b1),
+            _one_tensor(b2),
+            _one_tensor(b3),
+            _one_tensor(b4),
+            _one_tensor(b5),
+            _one_tensor(b6),
+            _one_tensor(b7),
+            _one_tensor(b8),
+            _one_tensor(f0),
+            _one_tensor(f1),
+            packs,
+        ).launch(
+            grid=(grid_x, 1, 1),
+            block=(_THREADS, 1, 1),
+            cluster=(1, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        dst: cute.Tensor,
+        b0: cute.Tensor,
+        b1: cute.Tensor,
+        b2: cute.Tensor,
+        b3: cute.Tensor,
+        b4: cute.Tensor,
+        b5: cute.Tensor,
+        b6: cute.Tensor,
+        b7: cute.Tensor,
+        b8: cute.Tensor,
+        f0: cute.Tensor,
+        f1: cute.Tensor,
+        packs: Int64,
+    ) -> None:
+        values = (b0, b1, b2, b3, b4, b5, b6, b7, b8)
+        partials = (f0, f1)
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        gdim, _, _ = cute.arch.grid_dim()
+        idx = Int64(bidx) * Int64(_THREADS) + Int64(tidx)
+        step = Int64(gdim) * Int64(_THREADS)
+        while idx < packs:
+            # One 16-byte BF16 pack: eight elements, two FP32 packs of four.
+            elem0 = idx * Int64(8)
+            total = cute.make_rmem_tensor((8,), Float32)
+            for source in cutlass.range_constexpr(self._bf16_sources):
+                words = ld_global_v4_u32(get_ptr_as_int64(values[source], elem0))
+                for word in cutlass.range_constexpr(4):
+                    low, high = _unpack_bf16x2(words[word])
+                    if cutlass.const_expr(source == 0):
+                        total[word * 2] = low
+                        total[word * 2 + 1] = high
+                    else:
+                        total[word * 2] = total[word * 2] + low
+                        total[word * 2 + 1] = total[word * 2 + 1] + high
+            for source in cutlass.range_constexpr(self._fp32_sources):
+                first = ld_global_v4_f32(get_ptr_as_int64(partials[source], elem0))
+                second = ld_global_v4_f32(
+                    get_ptr_as_int64(partials[source], elem0 + Int64(4))
+                )
+                for lane in cutlass.range_constexpr(4):
+                    total[lane] = total[lane] + first[lane]
+                    total[lane + 4] = total[lane + 4] + second[lane]
+            if cutlass.const_expr(self._store_bf16):
+                st_global_v4_u32(
+                    get_ptr_as_int64(dst, elem0),
+                    _pack_bf16x2(total[0], total[1]),
+                    _pack_bf16x2(total[2], total[3]),
+                    _pack_bf16x2(total[4], total[5]),
+                    _pack_bf16x2(total[6], total[7]),
+                )
+            else:
+                st_global_v4_f32(
+                    get_ptr_as_int64(dst, elem0), total[0], total[1], total[2], total[3]
+                )
+                st_global_v4_f32(
+                    get_ptr_as_int64(dst, elem0 + Int64(4)),
+                    total[4],
+                    total[5],
+                    total[6],
+                    total[7],
+                )
+            idx += step
+
+
 class _QuantLaunch:
     def __init__(self, codec: str) -> None:
         self._codec = codec
@@ -1364,6 +1491,23 @@ def _compiled_dequant_accum(codec: str, nsrc: int) -> Callable:
 
 
 @functools.cache
+def _compiled_tree_accum(bf16_sources: int, fp32_sources: int, store_bf16: bool) -> Callable:
+    launch = _TreeAccumLaunch(bf16_sources, fp32_sources, store_bf16)
+    value = _fake_ptr(cutlass.BFloat16, 16)
+    partial = _fake_ptr(Float32, 16)
+    return _compile(
+        "comm.pcie_dma.tree_accum",
+        (int(bf16_sources), int(fp32_sources), bool(store_bf16)),
+        launch,
+        value if store_bf16 else partial,
+        *(value for _ in range(_TREE_BF16_SOURCES)),
+        *(partial for _ in range(_TREE_FP32_SOURCES)),
+        Int64(1),
+        Int32(1),
+    )
+
+
+@functools.cache
 def _compiled_dequant_add_quant(codec: str, store_bf16: bool) -> Callable:
     launch = _DequantAddQuantLaunch(codec, store_bf16)
     return _compile(
@@ -1409,6 +1553,8 @@ class DmaLaunchers:
     dequant_accum: Callable | None = None
     dequant_add_quant_false: Callable | None = None
     dequant_add_quant_true: Callable | None = None
+    # Tree all-reduce accumulations: ((BF16 sources, FP32 partials, rounds to BF16), launcher).
+    tree_accum: tuple[tuple[tuple[int, int, bool], Callable], ...] = ()
 
     @property
     def __b12x_dependencies__(self):
@@ -1422,6 +1568,7 @@ class DmaLaunchers:
             self.dequant_accum,
             self.dequant_add_quant_false,
             self.dequant_add_quant_true,
+            tuple(launcher for _, launcher in self.tree_accum),
         )
 
     @property
@@ -1431,7 +1578,9 @@ class DmaLaunchers:
         return program_keys(self.__b12x_dependencies__)
 
 
-def compile_launchers(*, world_size: int, wire_mode: str) -> DmaLaunchers:
+def compile_launchers(
+    *, world_size: int, wire_mode: str, tree_variants: Sequence[tuple[int, int, bool]] = ()
+) -> DmaLaunchers:
     """Resolve the primitive programs reachable by declaration metadata."""
 
     if int(world_size) not in (2, 3, 4, 6, 8, 9, 10):
@@ -1456,6 +1605,11 @@ def compile_launchers(*, world_size: int, wire_mode: str) -> DmaLaunchers:
         dequant_add_quant_true=_compiled_dequant_add_quant(codec, True)
         if compressed
         else None,
+        tree_accum=tuple(
+            ((int(values), int(partials), bool(final)),
+             _compiled_tree_accum(int(values), int(partials), bool(final)))
+            for values, partials, final in tree_variants
+        ),
     )
 
 
@@ -1517,6 +1671,35 @@ class DmaKernels:
             _ptr(dtype, a_ptr, 16),
             _ptr(dtype, b_ptr, 16),
             () if wait is None else tuple(_ptr(Uint32, p, 4) for p in wait),
+            packs,
+            _grid_for_packs(packs),
+            current_cuda_stream(),
+        )
+
+    def dma_tree_accum(
+        self,
+        dst_ptr: int,
+        value_ptrs: Sequence[int],
+        partial_ptrs: Sequence[int],
+        elems: int,
+        store_bf16: bool,
+    ) -> None:
+        """Sum BF16 pieces then FP32 partials in the given order (see _TreeAccumLaunch)."""
+        key = (len(value_ptrs), len(partial_ptrs), bool(store_bf16))
+        raw = dict(self._require_launchers().tree_accum).get(key)
+        if raw is None:
+            raise RuntimeError(f"DMA tree accumulate {key} was not prepared")
+        if int(elems) % 8:
+            raise ValueError("tree accumulate covers whole 16-byte BF16 packs")
+        values = [int(address) for address in value_ptrs]
+        partials = [int(address) for address in partial_ptrs]
+        values += [values[0]] * (_TREE_BF16_SOURCES - len(values))
+        partials += [values[0]] * (_TREE_FP32_SOURCES - len(partials))
+        packs = int(elems) // 8
+        raw(
+            _ptr(cutlass.BFloat16 if store_bf16 else Float32, dst_ptr, 16),
+            *(_ptr(cutlass.BFloat16, address, 16) for address in values),
+            *(_ptr(Float32, address, 16) for address in partials),
             packs,
             _grid_for_packs(packs),
             current_cuda_stream(),

@@ -43,6 +43,8 @@ def query_from_runtime(runtime, *, surface: str, call) -> PcieQuery:
             "bf16_gather": bool(runtime._bf16_gather),
             "pieces_override": int(runtime._pieces_override),
             "a2a_chunks_override": int(runtime._a2a_chunks_override),
+            # Present only for a tree channel, so ring queries keep their identity.
+            **({"tree": str(runtime.tree)} if getattr(runtime, "tree", None) else {}),
             **dict(call),
         }
     )
@@ -75,7 +77,9 @@ def query_from_runtime(runtime, *, surface: str, call) -> PcieQuery:
             "flag_slots": 256,
             "flag_stride": 128,
             "steps": 2 * (int(runtime.world_size) - 1),
-            "slab_nbytes": 256 * 128
+            "slab_nbytes": int(runtime._slab_nbytes)
+            if getattr(runtime, "tree", None)
+            else 256 * 128
             + 2 * (int(runtime.world_size) - 1) * int(runtime.shard_capacity),
             "stage_nbytes": 0
             if runtime._fp8_stage is None
@@ -84,6 +88,11 @@ def query_from_runtime(runtime, *, surface: str, call) -> PcieQuery:
             "bf16_stage_nbytes": 0
             if runtime._bf16_stage is None
             else int(runtime._bf16_stage.numel()),
+            **(
+                {"tree_stage_nbytes": int(runtime._tree_stage.numel())}
+                if getattr(runtime, "tree", None)
+                else {}
+            ),
         }
     )
     return PcieQuery(
@@ -148,9 +157,19 @@ def compile_dma_surface(query_payload, ordinal: int) -> DmaLaunchers:
 
     query = PcieQuery(**dict(query_payload))
     values = _require(query.call, "wire_mode")
+    variants = ()
+    if values.get("tree"):
+        from ._dma_tree import schedule, topology
+
+        routing = topology(str(values["tree"]))
+        variants = tuple(
+            sorted({variant for pieces in (1, 2, 4) for variant in schedule(routing, pieces).variants})
+        )
     with torch.cuda.device(int(ordinal)):
         return compile_launchers(
-            world_size=query.world_size, wire_mode=str(values["wire_mode"])
+            world_size=query.world_size,
+            wire_mode=str(values["wire_mode"]),
+            tree_variants=variants,
         )
 
 
@@ -231,6 +250,7 @@ def plan(
             int(query.setup["slab_nbytes"])
             + int(query.setup["stage_nbytes"])
             + int(query.setup["bf16_stage_nbytes"])
+            + int(query.setup.get("tree_stage_nbytes", 0))
             + 3 * int(query.setup["flag_slots"]) * 4
         )
         # The runtime owns its IPC slab/stage before declaration; preparation
