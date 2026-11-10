@@ -1973,7 +1973,8 @@ class _CuTeOneshotBackend:
             device_index = plan.device_index
             plain_region_packs = (
                 plan.payload_ready_region_packs
-                if transport in ("remote_push_full", "remote_push_rsag")
+                if transport
+                in ("remote_push_full", "remote_push_rsag", "remote_push_rsag_side")
                 else plan.remote_push_region_packs
             )
             plain_capacity_packs = int(plan.eager_buffer_bytes or 0) // 16
@@ -3272,7 +3273,8 @@ class PCIeOneshotAllReduce:
                 call["size_packs"],
                 (
                     call["payload_ready_region_packs"]
-                    if call["transport"] in ("remote_push_full", "remote_push_rsag")
+                    if call["transport"]
+                    in ("remote_push_full", "remote_push_rsag", "remote_push_rsag_side")
                     else call["remote_push_region_packs"]
                 ),
                 int(state.eager_buffer_bytes or 0) // 16,

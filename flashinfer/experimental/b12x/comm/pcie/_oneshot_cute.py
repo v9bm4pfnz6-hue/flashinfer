@@ -32,6 +32,7 @@ from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils.device import current_cuda_stream
 from b12x._lib.utils.pointers import make_ptr
 
+from ._side_routes import side_entry_forwards
 from ._cute_intrinsics import (
     add_bf16x2,
     add_rn_f32,
@@ -256,6 +257,7 @@ class _OneshotLaunch(_PackedMath):
             "remote_push_simple",
             "remote_push_full",
             "remote_push_rsag",
+            "remote_push_rsag_side",
         ):
             raise ValueError(f"invalid plain oneshot transport {transport!r}")
         if transport.startswith("tp2_remote_push") and (
@@ -278,7 +280,13 @@ class _OneshotLaunch(_PackedMath):
             raise ValueError(
                 "tagged peer push requires graph-owned staged FP16/BF16 input"
             )
-        if transport in ("remote_push_full", "remote_push_rsag") and (
+        if transport == "remote_push_rsag_side" and world_size != 9:
+            raise ValueError("the side-entry result routes are defined for nine ranks")
+        if transport in (
+            "remote_push_full",
+            "remote_push_rsag",
+            "remote_push_rsag_side",
+        ) and (
             world_size not in (2, 3, 4, 6, 8, 9, 10)
             or not stage_input
             or not device_slot_selection
@@ -293,6 +301,14 @@ class _OneshotLaunch(_PackedMath):
         self._device_slot_selection = bool(device_slot_selection)
         self._slot_bias = int(slot_bias) & 1
         self._transport = transport
+        # Reduce-scatter, then the owners' results gathered: pushed to every peer, or sent
+        # along the nine-rank side-entry routes and forwarded by the ranks that receive them.
+        self._rsag = transport in ("remote_push_rsag", "remote_push_rsag_side")
+        self._side_forwards = (
+            side_entry_forwards(self._rank)
+            if transport == "remote_push_rsag_side"
+            else frozenset()
+        )
         self._threads = int(threads)
         self._pdl = _ONESHOT_PDL and transport == "pull"
 
@@ -524,7 +540,8 @@ class _OneshotLaunch(_PackedMath):
                         Uint32(gdim),
                     )
         elif cutlass.const_expr(
-            self._transport in ("remote_push_full", "remote_push_rsag")
+            self._transport
+            in ("remote_push_full", "remote_push_rsag", "remote_push_rsag_side")
         ):
             slot_table = peer_ptrs + Int64(slot) * Int64(_MAX_RANKS)
             local_base = Int64(slot_table[self._rank]) + plain_region_packs * Int64(16)
@@ -560,7 +577,7 @@ class _OneshotLaunch(_PackedMath):
             reduce_index = index
             while reduce_index < size_packs:
                 owner = Int32(self._rank)
-                if cutlass.const_expr(self._transport == "remote_push_rsag"):
+                if cutlass.const_expr(self._rsag):
                     owner = self._pack_owner(reduce_index, size_packs)
                 if owner == Int32(self._rank):
                     accumulator = cute.make_rmem_tensor((8,), Float32)
@@ -595,9 +612,27 @@ class _OneshotLaunch(_PackedMath):
                                     * Int64(16)
                                 )
                                 self._publish_bf16_words(destination, result)
+                    if cutlass.const_expr(self._transport == "remote_push_rsag_side"):
+                        # The result leaves along the side-entry routes: to this rank's
+                        # partner, to one member of each other leaf of its side and to one
+                        # rank of the other side.
+                        for peer in cutlass.range_constexpr(self._world_size):
+                            if cutlass.const_expr(
+                                (self._rank, peer) in self._side_forwards
+                            ):
+                                destination = (
+                                    Int64(slot_table[peer])
+                                    + plain_region_packs * Int64(16)
+                                    + (
+                                        Int64(self._rank) * plain_capacity_packs
+                                        + Int64(reduce_index)
+                                    )
+                                    * Int64(16)
+                                )
+                                self._publish_bf16_words(destination, result)
                 reduce_index += stride
 
-            if cutlass.const_expr(self._transport == "remote_push_rsag"):
+            if cutlass.const_expr(self._rsag):
                 # Input publication and output use identical pack ownership for aliases.
                 while index < size_packs:
                     owner = self._pack_owner(index, size_packs)
@@ -617,6 +652,29 @@ class _OneshotLaunch(_PackedMath):
                                     | ((words[word] & Uint32(0xFFFF)) == Uint32(0))
                                     | ((words[word] & Uint32(0xFFFF0000)) == Uint32(0))
                                 )
+                        if cutlass.const_expr(len(self._side_forwards) > 0):
+                            # Forward the published words of another owner's result to the
+                            # ranks that receive that owner's results from this one.
+                            for source in cutlass.range_constexpr(self._world_size):
+                                for child in cutlass.range_constexpr(self._world_size):
+                                    if cutlass.const_expr(
+                                        source != self._rank
+                                        and (source, child) in self._side_forwards
+                                    ):
+                                        if owner == Int32(source):
+                                            st_relaxed_sys_global_v4_u32(
+                                                Int64(slot_table[child])
+                                                + plain_region_packs * Int64(16)
+                                                + (
+                                                    Int64(source) * plain_capacity_packs
+                                                    + Int64(index)
+                                                )
+                                                * Int64(16),
+                                                gathered[0],
+                                                gathered[1],
+                                                gathered[2],
+                                                gathered[3],
+                                            )
                         st_global_v4_u32(
                             output_base + Int64(index) * Int64(16),
                             gathered[0],

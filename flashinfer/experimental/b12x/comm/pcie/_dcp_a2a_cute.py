@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import functools
 import os
 from collections.abc import Callable, Sequence
 
@@ -24,6 +23,7 @@ from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils.device import current_cuda_stream
 from b12x._lib.utils.pointers import make_ptr
 
+from ._side_routes import SIDE_ENTRY_RANKS, side_entry_phases
 from ._dcp_cute_common import (
     _membar_sys,
     block_pair_barrier,
@@ -165,50 +165,6 @@ def pair_gather_roles(rank: int) -> dict:
     )
 
 
-# The rank on the other side that receives each rank's segment in the side-entry gather: of all
-# assignments, the one with the fewest copies on the busiest link and then the smallest sum of the
-# three phases' busiest links.
-SIDE_ENTRY_RANKS = (5, 4, 6, 7, 8, 2, 8, 1, 7)
-
-
-@functools.cache
-def _side_entry_phases() -> tuple:
-    """Every ``(sender, source, child)`` of the side-entry gather, by phase."""
-    leaves = ((0, 1), (2, 3), (4, 5), (6, 7), (8,))
-    sides = ((8, 0, 1, 2, 3), (4, 5, 6, 7))
-    leaf_of = {rank: index for index, members in enumerate(leaves) for rank in members}
-    phases = ([], [], [])
-    for source in range(9):
-        mine, other = sides if source in sides[0] else sides[::-1]
-
-        def spread(origin, ranks):
-            # The partner of `origin` and one member of each other leaf among `ranks`.
-            targets = []
-            for index, members in enumerate(leaves):
-                here = [rank for rank in members if rank in ranks]
-                if index == leaf_of[origin]:
-                    targets += [rank for rank in here if rank != origin]
-                elif here:
-                    targets.append(here[(source + index) % len(here)])
-            return targets
-
-        entry = SIDE_ENTRY_RANKS[source]
-        for target in (*spread(source, mine), entry):
-            phases[0].append((source, source, target))
-        for sender, targets, phase in (
-            (source, spread(source, mine), 1),
-            (entry, spread(entry, other), 2),
-        ):
-            for target in targets:
-                if sender == entry:
-                    phases[1].append((entry, source, target))
-                if leaf_of[target] != leaf_of[sender]:
-                    for partner in leaves[leaf_of[target]]:
-                        if partner != target:
-                            phases[phase].append((target, source, partner))
-    return tuple(tuple(phase) for phase in phases)
-
-
 def side_entry_gather_roles(rank: int) -> tuple:
     """Pushes and barrier peers of one rank in the nine-rank side-entry gather.
 
@@ -229,7 +185,7 @@ def side_entry_gather_roles(rank: int) -> tuple:
     if not 0 <= rank < 9:
         raise ValueError("the side-entry gather is defined for ranks 0 to 8")
     roles = []
-    for phase in _side_entry_phases():
+    for phase in side_entry_phases():
         mask = 0
         for sender, _, child in phase:
             if sender == rank:

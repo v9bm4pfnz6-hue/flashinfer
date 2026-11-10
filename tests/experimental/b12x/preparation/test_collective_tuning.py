@@ -78,7 +78,7 @@ def test_dcp_candidates_coalesce_effective_grids_and_preserve_overrides():
 
 
 @pytest.mark.parametrize("shape", [(3, 1536), (513, 2560), (8,)])
-@pytest.mark.parametrize("world", (2, 3, 4, 6, 8, 10))
+@pytest.mark.parametrize("world", (2, 3, 4, 6, 8, 9, 10))
 @pytest.mark.parametrize("dtype", ("bfloat16", "float16"))
 def test_plain_catalog_uses_storage_bounds_instead_of_shape_policy(shape, world, dtype):
     from math import prod
@@ -127,6 +127,9 @@ def test_plain_catalog_uses_storage_bounds_instead_of_shape_policy(shape, world,
         expected |= {"tp2_remote_push", "tp2_remote_push_simple"}
     if dtype == "bfloat16":
         expected |= {"remote_push_full", "remote_push_rsag"}
+        if world == 9:
+            # Nine ranks also race the reduce-scatter whose results cross between the sides once.
+            expected |= {"remote_push_rsag_side"}
     assert set(alternatives) == expected
     query = CollectiveQuery(
         operation="all_reduce",
