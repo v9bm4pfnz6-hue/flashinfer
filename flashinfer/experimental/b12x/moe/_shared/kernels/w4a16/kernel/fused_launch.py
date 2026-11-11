@@ -818,6 +818,7 @@ def compile_w4a16_fused_moe(
         inkernel_route_pack=kernel.inkernel_route_pack,
         route_pack_max_routes=kernel.route_pack_max_routes,
         flow_flags=kernel.flow_flags,
+        non_cooperative_sms=kernel.non_cooperative_sms,
     )
     attach_programs(
         result, compiled, *(launch.compiled for launch in small_m_direct_launches)
@@ -1203,6 +1204,8 @@ def _w4a16_fused_persistent_grid_x(
     where the host cannot know route_blocks ahead of the launch.
     """
     cap = int(sms) * int(fused.blocks_per_sm)
+    if int(getattr(fused, "non_cooperative_sms", 0)) > 0:
+        cap = max(1, min(cap, int(fused.non_cooperative_sms) * int(fused.blocks_per_sm)))
     grid_env = os.environ.get("B12X_TRELLIS_GRID_X", "")
     if grid_env and fused.weight_layout == "trellis_t256":
         # Bench-only: fewer persistent CTAs (<= the co-residency cap, so the
