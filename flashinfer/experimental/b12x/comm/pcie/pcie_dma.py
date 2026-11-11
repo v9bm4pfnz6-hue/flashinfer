@@ -1524,11 +1524,14 @@ class PCIeDmaAllReduce:
         piece_bytes = nbytes // pieces
         kernels = self._kernels
         main = torch.cuda.current_stream(self.device)
+        ring_stream = getattr(self, '_ring_stream', None) or main
         copy_stream, flag_stream = self._copy_stream, self._flag_stream
         arrived, copied = self._piece_events, self._copied_events
         self._input_ready.record(main)
         copy_stream.wait_event(self._input_ready)
         flag_stream.wait_event(self._input_ready)
+        if ring_stream is not main:
+            ring_stream.wait_event(self._input_ready)
         for hop in range(world - 1):
             source = self._scratch_ptr(rank, world - 1 - hop)
             target = self._scratch_ptr(nxt, world - 2 - hop)
@@ -1549,26 +1552,37 @@ class PCIeDmaAllReduce:
                         self._flag_ptr(nxt, slot),
                         self._counter_ptr(self._send_counters, slot),
                     )
-                kernels.dma_wait_flag(
-                    self._flag_ptr(rank, slot),
-                    self._counter_ptr(self._wait_counters, slot),
-                )
-                arrived[piece].record(main)
-        main.wait_stream(copy_stream)
-        main.wait_stream(flag_stream)
+                with torch.cuda.stream(ring_stream):
+                    kernels.dma_wait_flag(
+                        self._flag_ptr(rank, slot),
+                        self._counter_ptr(self._wait_counters, slot),
+                    )
+                    arrived[piece].record(ring_stream)
+        with torch.cuda.stream(ring_stream):
+            ring_stream.wait_stream(copy_stream)
+            ring_stream.wait_stream(flag_stream)
+        if ring_stream is not main:
+            main.wait_stream(ring_stream)
 
     def _release_gather(self) -> None:
         """A reduction's closing handshake: this rank is done with its scratch, and waits for its successor."""
 
         world, rank = self.world_size, self.rank
         done = FLAG_SLOTS - 2
-        self._kernels.dma_set_flag(
-            self._flag_ptr((rank - 1) % world, done),
-            self._counter_ptr(self._send_counters, done),
-        )
-        self._kernels.dma_wait_flag(
-            self._flag_ptr(rank, done), self._counter_ptr(self._wait_counters, done)
-        )
+        main = torch.cuda.current_stream(self.device)
+        ring_stream = getattr(self, '_ring_stream', None) or main
+        if ring_stream is not main:
+            ring_stream.wait_stream(main)
+        with torch.cuda.stream(ring_stream):
+            self._kernels.dma_set_flag(
+                self._flag_ptr((rank - 1) % world, done),
+                self._counter_ptr(self._send_counters, done),
+            )
+            self._kernels.dma_wait_flag(
+                self._flag_ptr(rank, done), self._counter_ptr(self._wait_counters, done)
+            )
+        if ring_stream is not main:
+            main.wait_stream(ring_stream)
 
     @property
     def tree(self) -> Optional[str]:

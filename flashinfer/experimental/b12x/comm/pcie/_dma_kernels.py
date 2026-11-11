@@ -2141,7 +2141,7 @@ class DmaKernels:
             _ptr(out_sc_type, scales_out_ptr, 4 if out_mode == "mxfp16" else 16),
             tuple(_ptr(Uint32, p, 4) for p in wait),
             blocks,
-            _grid_for_quant_blocks(blocks),
+            min(12, _grid_for_quant_blocks(blocks)),
             current_cuda_stream(),
         )
 
@@ -2164,7 +2164,7 @@ class DmaKernels:
             _ptr(cutlass.BFloat16, src_ptr, 16),
             tuple(_ptr(Uint32, p, 4) for p in wait),
             packs,
-            _grid_for_packs(packs),
+            min(12, _grid_for_packs(packs)),
             current_cuda_stream(),
         )
 

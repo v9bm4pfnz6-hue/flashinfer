@@ -642,6 +642,8 @@ class W4A16FusedMoeKernel:
             )
         else:
             self.smem_carveout = None
+        noncoop_env = int(os.environ.get("B12X_W4A16_NONCOOP_PREFILL_SMS", "0") or 0)
+        self.non_cooperative_sms = noncoop_env if (noncoop_env > 0 and int(size_m) >= 512) else 0
 
     @property
     def __cache_key__(self) -> tuple[object, ...]:
@@ -698,6 +700,7 @@ class W4A16FusedMoeKernel:
             self.sms,
             self.shared_words,
             self.blocks_per_sm,
+            self.non_cooperative_sms,
         )
 
     @cute.jit
@@ -1036,7 +1039,7 @@ class W4A16FusedMoeKernel:
             # activation, and FC2. Require whole-grid admission so unrelated
             # work cannot occupy an SM while resident CTAs wait for peers that
             # have not been scheduled yet.
-            cooperative=True,
+            cooperative=not bool(self.non_cooperative_sms),
             # Occupancy uses the full SMEM budget. CUTLASS's automatic carveout
             # omits the per-CTA reservation: two 32 KiB Q8_0 CTAs request a
             # 64 KiB carveout but cannot both reside there, rejecting the

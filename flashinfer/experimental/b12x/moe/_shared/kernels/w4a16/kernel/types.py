@@ -127,6 +127,7 @@ class W4A16FusedMoeCompileResult:
     inkernel_route_pack: bool = False
     route_pack_max_routes: int = 128
     flow_flags: bool = False
+    non_cooperative_sms: int = 0
 
 
 @dataclass(frozen=True)
