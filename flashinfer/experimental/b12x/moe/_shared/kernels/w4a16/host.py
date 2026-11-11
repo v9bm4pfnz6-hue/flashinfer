@@ -269,11 +269,18 @@ def trellis_prefill_launch_shape(m: int) -> dict | None:
 # 2,742 against 2,880, 2,560 rows 3,872 against 4,183. The tile changes the
 # FP32 summation order over K (same arithmetic precision).
 def trellis_prefill_table_shape(m: int) -> dict | None:
-    """Direct-table prefill launch shape (block, stages, table, tile), or None."""
-    if os.getenv("B12X_W4A16_PREFILL_TABLE", "0") != "1":
+    """Direct-table prefill launch shape (block, stages, table, tile), or None.
+
+    Mode 1 covers 1,536..2,560 tokens; mode 2 extends the same 64 KiB
+    direct-table 48-row geometry to all large prefill capacities (m >= 1536,
+    including 4,608-row chunks where 48-row blocks cut 64-row route padding by
+    25% at identical per-CTA shared memory).
+    """
+    mode = os.getenv("B12X_W4A16_PREFILL_TABLE", "0")
+    if mode not in ("1", "2"):
         return None
     m = int(m)
-    if 1536 <= m <= 2560:
+    if (mode == "1" and 1536 <= m <= 2560) or (mode == "2" and m >= 1536):
         return {
             "block_size_m": 48,
             "pipeline_stages": 2,
