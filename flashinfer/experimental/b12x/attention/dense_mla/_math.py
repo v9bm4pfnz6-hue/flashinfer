@@ -16,7 +16,6 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from b12x._lib.intrinsics.atomics import (
-    atomic_max_shared_f32,
     ld_shared_f32,
     ld_shared_u32,
     st_shared_bf16_from_f32,
@@ -31,7 +30,7 @@ from b12x._lib.intrinsics.memory import (
     st_shared_u8,
 )
 from b12x._lib.intrinsics.conversion import cvt_f32_to_e4m3, fp8_e4m3_to_f32
-from b12x._lib.intrinsics.math import fabs_f32, fmax_f32, fmin_f32
+from b12x._lib.intrinsics.math import fmax_f32, fmin_f32
 from b12x._lib.intrinsics.constants import mma_m16n8k16_f32_bf16
 from b12x._lib.intrinsics.mma import mma_m16n8k32_f32_e4m3
 
@@ -375,7 +374,11 @@ def online_softmax(
     global_sum[1] = global_sum[1] * alpha1 + block_sum1 * block_scale1
     global_max[0] = new_max0
     global_max[1] = new_max1
-    return p, warp_scale0, warp_scale1
+    # block_scale is exp2(block_max - new_max).  The largest probability of a
+    # warp is exactly one, so it is also the exact maximum of probability times
+    # warp_scale over the chunk; the PV epilogue reuses it as the HIGH/LOW
+    # quantization maximum instead of recomputing it with shared atomics.
+    return p, warp_scale0, warp_scale1, block_scale0, block_scale1
 
 
 @cute.jit
@@ -469,7 +472,8 @@ def pv_fp8(
     weight_addr: Int32,
     local_warp: Int32,
     lane: Int32,
-    local_tid: Int32,
+    maximum0: Float32,
+    maximum1: Float32,
     *,
     record_stride_bytes: cutlass.Constexpr,
     barrier_id: cutlass.Constexpr,
@@ -484,38 +488,16 @@ def pv_fp8(
     candidate1 = candidate0 + Int32(8)
     weight_stride = CANDIDATES_PER_CHUNK + 16
 
-    if local_tid < Int32(16):
-        st_shared_f32(
-            weight_scale_addr + local_tid * Int32(4),
-            Float32(0.0),
-        )
-    cute.arch.barrier(barrier_id=barrier_id, number_of_threads=128)
-
-    atomic_max_shared_f32(
-        weight_scale_addr + head0 * Int32(4),
-        fmax_f32(fabs_f32(weights[0]), fabs_f32(weights[2])),
-    )
-    atomic_max_shared_f32(
-        weight_scale_addr + head1 * Int32(4),
-        fmax_f32(fabs_f32(weights[1]), fabs_f32(weights[3])),
-    )
-    cute.arch.barrier(barrier_id=barrier_id, number_of_threads=128)
-
-    if local_tid < Int32(HEADS_PER_TILE):
-        maximum = fmax_f32(
-            ld_shared_f32(weight_scale_addr + local_tid * Int32(4)),
-            Float32(1.0e-10),
-        )
-        scale = maximum * Float32(1.0 / _FP8_MAX)
-        st_shared_f32(weight_scale_addr + local_tid * Int32(4), scale)
-        st_shared_f32(
-            weight_scale_addr + (local_tid + Int32(HEADS_PER_TILE)) * Int32(4),
-            Float32(1.0) / scale,
-        )
-    cute.arch.barrier(barrier_id=barrier_id, number_of_threads=128)
-
-    inv0 = ld_shared_f32(weight_scale_addr + (head0 + Int32(HEADS_PER_TILE)) * Int32(4))
-    inv1 = ld_shared_f32(weight_scale_addr + (head1 + Int32(HEADS_PER_TILE)) * Int32(4))
+    # online_softmax already formed the per-head block scale
+    # exp2(block_max - new_max).  The largest probability in a warp is exactly
+    # one (the argmax element evaluates exp2(0)), so that block scale is the
+    # exact maximum of probability times warp_scale over the chunk.  Deriving
+    # the HIGH/LOW quantization scale from it replaces the shared atomic
+    # maximum and its two synchronizations with identical arithmetic.
+    scale0 = fmax_f32(maximum0, Float32(1.0e-10)) * Float32(1.0 / _FP8_MAX)
+    scale1 = fmax_f32(maximum1, Float32(1.0e-10)) * Float32(1.0 / _FP8_MAX)
+    inv0 = Float32(1.0) / scale0
+    inv1 = Float32(1.0) / scale1
     h00, l00 = _quantized_probability(weights[0] * inv0)
     h01, l01 = _quantized_probability(weights[1] * inv1)
     h10, l10 = _quantized_probability(weights[2] * inv0)
@@ -560,6 +542,12 @@ def pv_fp8(
         + candidate1,
         l11.to(cutlass.Uint8),
     )
+    # One owner per head publishes the quantization scale for the PV rows.  Every
+    # thread that holds the head computes the same bits, so the redundant
+    # writers in the other warps store identical values.
+    if gid == Int32(0):
+        st_shared_f32(weight_scale_addr + head0 * Int32(4), scale0)
+        st_shared_f32(weight_scale_addr + head1 * Int32(4), scale1)
     cute.arch.barrier(barrier_id=barrier_id, number_of_threads=128)
 
     a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
