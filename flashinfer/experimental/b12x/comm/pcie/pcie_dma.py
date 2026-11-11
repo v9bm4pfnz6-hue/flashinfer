@@ -294,6 +294,7 @@ class PCIeDmaAllReduce:
         bf16_first_hop: bool = False,
         bf16_direct: bool = False,
         fp24_ring: bool = False,
+        mxfp16_ring: bool = False,
         tree: Optional[str] = None,
         ipc=None,
     ) -> None:
@@ -326,9 +327,9 @@ class PCIeDmaAllReduce:
             tuple[tuple[torch.Tensor, torch.Tensor, torch.cuda.CUDAGraph], ...],
         ] = {}
 
-        if bf16_direct and fp24_ring:
-            raise ValueError("bf16_direct and fp24_ring are mutually exclusive")
-        self._direct_mode = "fp24" if fp24_ring else "fp32" if bf16_direct else ""
+        if int(bool(bf16_direct)) + int(bool(fp24_ring)) + int(bool(mxfp16_ring)) > 1:
+            raise ValueError("bf16_direct, fp24_ring, and mxfp16_ring are mutually exclusive")
+        self._direct_mode = "mxfp16" if mxfp16_ring else "fp24" if fp24_ring else "fp32" if bf16_direct else ""
         base_shard_capacity = _align_up(
             (self.max_bytes + self.world_size - 1) // self.world_size, SCRATCH_ALIGN
         )
@@ -341,6 +342,13 @@ class PCIeDmaAllReduce:
                 fp24_bytes = self._direct_max_shard_elems * 3
                 base_shard_capacity = max(
                     base_shard_capacity, _align_up(fp24_bytes, SCRATCH_ALIGN)
+                )
+            elif self._direct_mode == "mxfp16":
+                mxfp16_bytes = self._direct_max_shard_elems * 2 + _align_up(
+                    self._direct_max_shard_elems // 32, SCRATCH_ALIGN
+                )
+                base_shard_capacity = max(
+                    base_shard_capacity, _align_up(mxfp16_bytes, SCRATCH_ALIGN)
                 )
         self.shard_capacity = base_shard_capacity
         steps = 2 * (self.world_size - 1)
@@ -1242,7 +1250,9 @@ class PCIeDmaAllReduce:
         prv = (rank - 1) % world
         mid_mode = self._direct_mode
         max_interval_elems = (
-            (self.shard_capacity // 3) // 256 * 256
+            total_shard_elems
+            if mid_mode == "mxfp16"
+            else (self.shard_capacity // 3) // 256 * 256
             if mid_mode == "fp24"
             else (self.shard_capacity // 4) // 256 * 256
         )
@@ -1265,7 +1275,10 @@ class PCIeDmaAllReduce:
             pieces = self._pick_direct_pieces(shard_elems)
             piece_elems = shard_elems // pieces
             bf16_piece_bytes = piece_elems * 2
-            if mid_mode == "fp24":
+            if mid_mode == "mxfp16":
+                sc_bytes = _align_up(piece_elems // 32, 16)
+                mid_piece_bytes = bf16_piece_bytes + sc_bytes
+            elif mid_mode == "fp24":
                 lo_bytes = _align_up(piece_elems, 16)
                 mid_piece_bytes = bf16_piece_bytes + lo_bytes
             else:
@@ -1346,7 +1359,7 @@ class PCIeDmaAllReduce:
                             out_m = "bf16" if k == world - 2 else mid_mode
                             recv_bytes = bf16_piece_bytes if k == 0 else mid_piece_bytes
                             wire_in = scratch_ptr(rank, k, p, recv_bytes)
-                            scales_in = wire_in + bf16_piece_bytes if in_m == "fp24" else wire_in
+                            scales_in = wire_in + bf16_piece_bytes if in_m in ("fp24", "mxfp16") else wire_in
                             if k == world - 2:
                                 if not reduce_scatter_only and in_base == out_base and recv_chunk == rank:
                                     ring_stream.wait_event(copied[slot(0, p)])
@@ -1356,7 +1369,7 @@ class PCIeDmaAllReduce:
                                 if k >= 2:
                                     ring_stream.wait_event(copied[slot(k - 1, p)])
                                 out_ptr = stage_ptr(k & 1, p)
-                                scales_out = out_ptr + bf16_piece_bytes if out_m == "fp24" else out_ptr
+                                scales_out = out_ptr + bf16_piece_bytes if out_m in ("fp24", "mxfp16") else out_ptr
                             kernels.dma_direct_step(
                                 in_m,
                                 out_m,

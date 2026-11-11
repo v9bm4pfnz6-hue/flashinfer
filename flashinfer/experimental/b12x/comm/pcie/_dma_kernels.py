@@ -841,11 +841,93 @@ def _unpack_fp24x4(
     )
 
 
+@dsl_user_op
+def _finite_fabs_f32(v: Float32, *, loc=None, ip=None) -> Float32:
+    """Return |v| for finite IEEE binary32 values and 0.0 for +-Inf or NaN."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(v).ir_value(loc=loc, ip=ip)],
+            """
+            {
+                .reg .pred is_fin;
+                .reg .u32 bits;
+                mov.b32 bits, $1;
+                and.b32 bits, bits, 0x7fffffff;
+                setp.lt.u32 is_fin, bits, 0x7f800000;
+                mov.b32 $0, bits;
+                @!is_fin mov.f32 $0, 0f00000000;
+            }
+            """,
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _mxfp16_scale_byte(amax: Float32, *, loc=None, ip=None) -> Uint32:
+    """Power-of-two E8M0 scale byte mapping finite amax into [0, 32768] for IEEE binary16 payloads."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(amax).ir_value(loc=loc, ip=ip)],
+            """
+            {
+                .reg .pred is_zero, is_underflow, has_mantissa;
+                .reg .u32 original, bits, mantissa, byte;
+                mov.b32 original, $1;
+                and.b32 original, original, 0x7fffffff;
+                setp.eq.u32 is_zero, original, 0;
+                mul.rn.f32 $1, $1, 0f38000000;
+                mov.b32 bits, $1;
+                and.b32 mantissa, bits, 0x007fffff;
+                setp.ne.u32 has_mantissa, mantissa, 0;
+                setp.le.u32 is_underflow, bits, 0x00800000;
+                @has_mantissa add.u32 bits, bits, 0x00800000;
+                bfe.u32 byte, bits, 23, 8;
+                @is_underflow mov.u32 byte, 1;
+                @is_zero mov.u32 byte, 127;
+                mov.u32 $0, byte;
+            }
+            """,
+            "=r,+f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _pack_f16x2_ieee(v0: Float32, v1: Float32, *, loc=None, ip=None) -> Uint32:
+    """Pack two FP32 values into IEEE binary16x2 (unsaturated so +-Inf and NaN preserve exactly)."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(v0).ir_value(loc=loc, ip=ip), Float32(v1).ir_value(loc=loc, ip=ip)],
+            "cvt.rn.f16x2.f32 $0, $2, $1;",
+            "=r,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
 class _DirectRingStepLaunch:
     """Fused wait + direct BF16 local add + wire decode/encode for zero-copy ring reduce-scatter."""
 
     def __init__(self, in_mode: str, out_mode: str) -> None:
-        if in_mode not in ("bf16", "fp32", "fp24") or out_mode not in ("fp32", "fp24", "bf16"):
+        if in_mode not in ("bf16", "fp32", "fp24", "mxfp16") or out_mode not in ("fp32", "fp24", "mxfp16", "bf16"):
             raise ValueError(f"unsupported direct ring step modes {in_mode!r} -> {out_mode!r}")
         self._in_mode = in_mode
         self._out_mode = out_mode
@@ -911,6 +993,14 @@ class _DirectRingStepLaunch:
             elif cutlass.const_expr(self._in_mode == "fp32"):
                 bv = ld_global_v4_f32(get_ptr_as_int64(wire_in, elem0))
                 b0, b1, b2, b3 = bv[0], bv[1], bv[2], bv[3]
+            elif cutlass.const_expr(self._in_mode == "mxfp16"):
+                h01, h23 = _ld_global_v2_u32(get_ptr_as_int64(wire_in, elem0 // Int64(2)))
+                scale_group_in = lane >> Int32(3)
+                scale_idx_in = block * Int64(_MX_SCALES_PER_BLOCK) + Int64(scale_group_in)
+                scale_in = _mx_scale(_ld_global_u8(get_ptr_as_int64(scales_in, scale_idx_in)))
+                u0, u1 = f16x2_to_f32x2(h01)
+                u2, u3 = f16x2_to_f32x2(h23)
+                b0, b1, b2, b3 = u0 * scale_in, u1 * scale_in, u2 * scale_in, u3 * scale_in
             else:
                 hi01, hi23 = _ld_global_v2_u32(get_ptr_as_int64(wire_in, elem0 // Int64(2)))
                 lo0123 = _ld_global_u32(get_ptr_as_int64(scales_in, elem0 // Int64(4)))
@@ -923,6 +1013,29 @@ class _DirectRingStepLaunch:
                 st_global_v4_f32(get_ptr_as_int64(out_data, elem0), v0, v1, v2, v3)
             elif cutlass.const_expr(self._out_mode == "bf16"):
                 _store_bf16x4(out_data, elem0, v0, v1, v2, v3)
+            elif cutlass.const_expr(self._out_mode == "mxfp16"):
+                fmax_local = fmax_f32(
+                    fmax_f32(_finite_fabs_f32(v0), _finite_fabs_f32(v1)),
+                    fmax_f32(_finite_fabs_f32(v2), _finite_fabs_f32(v3)),
+                )
+                amax = fmax_local
+                for offset in cutlass.range_constexpr(3):
+                    amax = fmax_f32(
+                        amax,
+                        cute.arch.shuffle_sync_bfly(
+                            amax, offset=4 >> offset, mask_and_clamp=0x1807
+                        ),
+                    )
+                scale_byte = _mxfp16_scale_byte(amax)
+                scale_group_out = lane >> Int32(3)
+                scale_lane_out = lane & Int32(7)
+                if scale_lane_out == Int32(0):
+                    scale_idx_out = block * Int64(_MX_SCALES_PER_BLOCK) + Int64(scale_group_out)
+                    _st_global_u8(get_ptr_as_int64(scales_out, scale_idx_out), scale_byte)
+                inv_scale = _mx_inv_scale(scale_byte)
+                p01 = _pack_f16x2_ieee(v0 * inv_scale, v1 * inv_scale)
+                p23 = _pack_f16x2_ieee(v2 * inv_scale, v3 * inv_scale)
+                _st_global_v2_u32(get_ptr_as_int64(out_data, elem0 // Int64(2)), p01, p23)
             else:
                 p_hi01, p_hi23, p_lo = _pack_fp24x4(v0, v1, v2, v3)
                 _st_global_v2_u32(get_ptr_as_int64(out_data, elem0 // Int64(2)), p_hi01, p_hi23)
@@ -1847,7 +1960,7 @@ def _direct_wire_type(mode: str) -> type[cutlass.Numeric]:
         return cutlass.BFloat16
     if mode == "fp32":
         return Float32
-    if mode == "fp24":
+    if mode in ("fp24", "mxfp16"):
         return Uint32
     raise ValueError(f"unknown direct wire mode {mode!r}")
 
@@ -1857,15 +1970,17 @@ def _compiled_direct_ring_step(in_mode: str, out_mode: str) -> Callable:
     launch = _DirectRingStepLaunch(in_mode, out_mode)
     in_type = _direct_wire_type(in_mode)
     out_type = _direct_wire_type(out_mode)
+    in_sc_type = Uint8 if in_mode == "mxfp16" else Uint32
+    out_sc_type = Uint8 if out_mode == "mxfp16" else Uint32
     return _compile(
         "comm.pcie_dma.direct_step",
         (in_mode, out_mode),
         launch,
         _fake_ptr(cutlass.BFloat16, 16),
         _fake_ptr(in_type, 16),
-        _fake_ptr(Uint32, 16),
+        _fake_ptr(in_sc_type, 4 if in_mode == "mxfp16" else 16),
         _fake_ptr(out_type, 16),
-        _fake_ptr(Uint32, 16),
+        _fake_ptr(out_sc_type, 4 if out_mode == "mxfp16" else 16),
         tuple(_fake_ptr(Uint32, 4) for _ in range(3)),
         Int64(1),
         Int32(1),
@@ -2016,12 +2131,14 @@ class DmaKernels:
         blocks = int(elems) // _QUANT_BLOCK
         in_type = _direct_wire_type(in_mode)
         out_type = _direct_wire_type(out_mode)
+        in_sc_type = Uint8 if in_mode == "mxfp16" else Uint32
+        out_sc_type = Uint8 if out_mode == "mxfp16" else Uint32
         raw(
             _ptr(cutlass.BFloat16, local_bf16_ptr, 16),
             _ptr(in_type, wire_in_ptr, 16),
-            _ptr(Uint32, scales_in_ptr, 16),
+            _ptr(in_sc_type, scales_in_ptr, 4 if in_mode == "mxfp16" else 16),
             _ptr(out_type, out_ptr, 16),
-            _ptr(Uint32, scales_out_ptr, 16),
+            _ptr(out_sc_type, scales_out_ptr, 4 if out_mode == "mxfp16" else 16),
             tuple(_ptr(Uint32, p, 4) for p in wait),
             blocks,
             _grid_for_quant_blocks(blocks),
