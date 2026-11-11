@@ -1,6 +1,7 @@
-"""B12X_W4A16_PREFILL_TABLE=1: direct decode table for large-M Trellis prefill blocks.
+"""B12X_W4A16_PREFILL_TABLE: direct decode table for large-M Trellis prefill blocks.
 
-Policy table, decode-size gate, and the kernel geometry it selects (constructed, not compiled).
+Mode 1 applies it to launches of 1,536 to 2,560 tokens, mode 2 to every launch of 1,536 tokens and
+more. Policy table, decode-size gate, and the kernel geometry it selects (constructed, not compiled).
 """
 from __future__ import annotations
 
@@ -22,7 +23,7 @@ def test_off_by_default(monkeypatch, shapes, m):
     assert shape is None or shape["trellis_decode_table"] != "full1"
 
 
-@pytest.mark.parametrize("mode", ["1"])
+@pytest.mark.parametrize("mode", ["1", "2"])
 @pytest.mark.parametrize("shapes", ["0", "1"])
 @pytest.mark.parametrize("m", [1, 2, 3, 4, 5, 8, 12, 16, 17, 32, 64, 127, 128, 512, 1024, 1535])
 def test_small_sizes_untouched_when_on(monkeypatch, mode, shapes, m):
@@ -43,7 +44,11 @@ _R48 = (48, 2, "full1", (128, 128, 64, 256))
     [
         ("1", 1536, _R48), ("1", 2047, _R48), ("1", 2048, _R48), ("1", 2559, _R48), ("1", 2560, _R48),
         ("1", 2561, None), ("1", 3072, None), ("1", 8192, None),
-        ("2", 1536, None), ("2", 2048, None), ("2", 3072, None),
+        # Mode 2 has no upper bound: the 3,072-, 4,096- and 4,608-row prefill graphs take the table too.
+        ("2", 1535, None), ("2", 1536, _R48), ("2", 2048, _R48), ("2", 2560, _R48), ("2", 2561, _R48),
+        ("2", 3072, _R48), ("2", 4096, _R48), ("2", 4608, _R48), ("2", 8192, _R48),
+        # Any other value leaves the table off.
+        ("3", 1536, None), ("3", 2048, None), ("3", 3072, None), ("3", 4608, None),
     ],
 )
 def test_policy_table(monkeypatch, mode, m, expected):
@@ -82,7 +87,7 @@ def _kimi_fused(size_m, block, stages, table, tile):
     )
 
 
-@pytest.mark.parametrize("mode,m", [("1", 1536), ("1", 2048), ("1", 2560)])
+@pytest.mark.parametrize("mode,m", [("1", 1536), ("1", 2048), ("1", 2560), ("2", 3072), ("2", 4096), ("2", 4608)])
 def test_policy_geometry_holds_the_direct_table(monkeypatch, mode, m):
     monkeypatch.setenv("B12X_W4A16_PREFILL_TABLE", mode)
     shape = trellis_prefill_table_shape(m)
