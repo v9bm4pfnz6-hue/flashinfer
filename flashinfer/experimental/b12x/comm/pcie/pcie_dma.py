@@ -292,6 +292,8 @@ class PCIeDmaAllReduce:
         fp8: Optional[str] = None,
         bf16_gather: bool = False,
         bf16_first_hop: bool = False,
+        bf16_direct: bool = False,
+        fp24_ring: bool = False,
         tree: Optional[str] = None,
         ipc=None,
     ) -> None:
@@ -324,9 +326,23 @@ class PCIeDmaAllReduce:
             tuple[tuple[torch.Tensor, torch.Tensor, torch.cuda.CUDAGraph], ...],
         ] = {}
 
-        self.shard_capacity = _align_up(
+        if bf16_direct and fp24_ring:
+            raise ValueError("bf16_direct and fp24_ring are mutually exclusive")
+        self._direct_mode = "fp24" if fp24_ring else "fp32" if bf16_direct else ""
+        base_shard_capacity = _align_up(
             (self.max_bytes + self.world_size - 1) // self.world_size, SCRATCH_ALIGN
         )
+        self._direct_max_shard_elems = 0
+        if self._direct_mode:
+            self._direct_max_shard_elems = _align_up(
+                (self.max_bytes // 2 + self.world_size - 1) // self.world_size, 256
+            )
+            if self._direct_mode == "fp24":
+                fp24_bytes = self._direct_max_shard_elems * 3
+                base_shard_capacity = max(
+                    base_shard_capacity, _align_up(fp24_bytes, SCRATCH_ALIGN)
+                )
+        self.shard_capacity = base_shard_capacity
         steps = 2 * (self.world_size - 1)
         flags_bytes = FLAG_SLOTS * FLAG_STRIDE
         scratch_bytes = steps * self.shard_capacity
@@ -388,13 +404,14 @@ class PCIeDmaAllReduce:
             FLAG_SLOTS, dtype=torch.int32, device=self.device
         )
         self._wait_done = torch.zeros(FLAG_SLOTS, dtype=torch.int32, device=self.device)
-        self._copy_stream = torch.cuda.Stream(device=self.device)
-        self._flag_stream = torch.cuda.Stream(device=self.device)
+        self._copy_stream = torch.cuda.Stream(device=self.device, priority=-1)
+        self._flag_stream = torch.cuda.Stream(device=self.device, priority=-1)
+        self._ring_stream = torch.cuda.Stream(device=self.device, priority=-1)
         # Separate CE/flag streams for the a2a broadcast phase so allgather
         # traffic overlaps reduce-scatter traffic instead of queueing
         # behind it.
-        self._ag_copy_stream = torch.cuda.Stream(device=self.device)
-        self._ag_flag_stream = torch.cuda.Stream(device=self.device)
+        self._ag_copy_stream = torch.cuda.Stream(device=self.device, priority=-1)
+        self._ag_flag_stream = torch.cuda.Stream(device=self.device, priority=-1)
         # Persistent cross-stream events: captured graphs keep references to
         # recorded events, so per-call temporaries must not be destroyed.
         self._piece_events = [torch.cuda.Event() for _ in range(MAX_PIECES)]
@@ -441,6 +458,15 @@ class PCIeDmaAllReduce:
         if bf16_first_hop and not self._bf16_gather:
             raise ValueError("a BF16 first hop belongs to the BF16 broadcast ring")
         self._bf16_first_hop = bool(bf16_first_hop)
+        self._direct_stage = None
+        if self._direct_mode:
+            if self._fp8 or self._bf16_gather or self._tree is not None:
+                raise ValueError(
+                    "direct BF16/fp24 ring modes cannot combine with tree, compressed, or FP32-packet modes"
+                )
+            self._direct_stage = torch.empty(
+                2 * self.shard_capacity, dtype=torch.uint8, device=self.device
+            )
         self._tree_stage = None
         if self._tree is not None:
             if self._fp8 or self._bf16_gather:
@@ -531,6 +557,12 @@ class PCIeDmaAllReduce:
         if inp.dtype not in SUPPORTED_DTYPES:
             return False
         numel = inp.numel()
+        if getattr(self, '_direct_mode', ''):
+            if inp.dtype != torch.bfloat16 or numel <= 0 or numel % (self.world_size * 128) != 0:
+                return False
+            max_direct_bytes = max(self.max_bytes, self._direct_max_shard_elems * self.world_size * 2)
+            size_bytes = numel * 2
+            return inp.is_contiguous() and self.min_bytes <= size_bytes <= max_direct_bytes
         if numel <= 0 or numel % (self.world_size * 8) != 0:
             return False
         size_bytes = numel * inp.element_size()
@@ -549,6 +581,12 @@ class PCIeDmaAllReduce:
         """True when packets are declared BF16-valued and the first reduce hop carries BF16."""
 
         return self._bf16_first_hop
+
+    @property
+    def direct_mode(self) -> str:
+        """Direct zero-copy BF16 ring mode: empty, fp32, or fp24."""
+
+        return self._direct_mode
 
     def prepare_eager_replay(
         self, dtype: torch.dtype, *, max_elements: int | None = None
@@ -629,6 +667,21 @@ class PCIeDmaAllReduce:
             out = torch.empty_like(inp)
         return state.run(inp, out=out)
 
+    def reduce_scatter(
+        self,
+        inp: torch.Tensor,
+        *,
+        plan: Plan,
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the 8-hop reduce-scatter half of a direct BF16/mx16 ring channel into rank-owned out."""
+
+        state = require_prepared(plan, "comm.pcie", self.device)
+        if not hasattr(state, "require_runtime") or not hasattr(state, "run_reduce_scatter"):
+            raise TypeError("plan does not contain a prepared direct DMA channel")
+        state.require_runtime(self)
+        return state.run_reduce_scatter(inp, out=out)
+
     @contextmanager
     def capture(self, stream: torch.cuda.Stream | None = None):
         """Retain the ordered DMA channel while recording a CUDA graph.
@@ -677,6 +730,8 @@ class PCIeDmaAllReduce:
             )
         if self._tree is not None:
             return self._run_tree(inp, out)
+        if getattr(self, '_direct_mode', ''):
+            return self._run_direct_bf16(inp, out, reduce_scatter_only=False)
         replays = self._eager_replays.get(inp.dtype)
         if replays is not None and not torch.cuda.is_current_stream_capturing():
             elements = inp.numel()
@@ -1140,6 +1195,206 @@ class PCIeDmaAllReduce:
         )
         return out
 
+    def _pick_direct_pieces(self, shard_elems: int) -> int:
+        override = getattr(self, '_pieces_override', 0)
+        def usable(p: int) -> bool:
+            return shard_elems % (p * 128) == 0 and (p == 1 or (shard_elems * 2) // p >= (512 << 10))
+        if 1 <= override <= MAX_PIECES and usable(override):
+            return override
+        return 2 if usable(2) else 1
+
+    def _run_direct_bf16(
+        self, inp: torch.Tensor, out: torch.Tensor, *, reduce_scatter_only: bool = False
+    ) -> torch.Tensor:
+        """Zero-copy BF16 direct-input/output ring (fp32 or fp24 intermediate wire)."""
+        if not getattr(self, '_direct_mode', ''):
+            raise ValueError("direct BF16 ring requires bf16_direct or fp24_ring")
+        world = self.world_size
+        rank = self.rank
+        if (
+            inp.dtype != torch.bfloat16
+            or out.dtype != torch.bfloat16
+            or not inp.is_contiguous()
+            or not out.is_contiguous()
+            or inp.numel() <= 0
+            or inp.numel() % (world * 128) != 0
+            or inp.data_ptr() % 16 != 0
+            or out.data_ptr() % 16 != 0
+        ):
+            raise ValueError("direct BF16 ring requires 16-byte aligned contiguous BF16 tensors with 128-element shards")
+        total_shard_elems = inp.numel() // world
+        if reduce_scatter_only:
+            if out.numel() != total_shard_elems:
+                raise ValueError("reduce_scatter output must hold exactly inp.numel() // world_size elements")
+            if inp.data_ptr() < out.data_ptr() + out.nbytes and out.data_ptr() < inp.data_ptr() + inp.nbytes:
+                raise ValueError("reduce_scatter input and output must be disjoint")
+        else:
+            if out.numel() != inp.numel():
+                raise ValueError("all_reduce output must match input element count")
+            if inp.data_ptr() != out.data_ptr() and (
+                inp.data_ptr() < out.data_ptr() + out.nbytes
+                and out.data_ptr() < inp.data_ptr() + inp.nbytes
+            ):
+                raise ValueError("all_reduce input and output must be identical or disjoint")
+
+        kernels = self._kernels
+        nxt = (rank + 1) % world
+        prv = (rank - 1) % world
+        mid_mode = self._direct_mode
+        max_interval_elems = (
+            (self.shard_capacity // 3) // 256 * 256
+            if mid_mode == "fp24"
+            else (self.shard_capacity // 4) // 256 * 256
+        )
+        if max_interval_elems <= 0:
+            raise ValueError("shard_capacity cannot hold one 256-element direct interval")
+
+        in_base, out_base = inp.data_ptr(), out.data_ptr()
+        stage_base = self._direct_stage.data_ptr()
+        main = torch.cuda.current_stream(self.device)
+        ring_stream = getattr(self, '_ring_stream', None) or main
+        copy_stream = self._copy_stream
+        flag_stream = self._flag_stream
+        add_done = self._piece_events
+        copied = self._copied_events
+        total_steps = (world - 1) if reduce_scatter_only else 2 * (world - 1)
+        done_slot = FLAG_SLOTS - 3
+
+        for first_elem in range(0, total_shard_elems, max_interval_elems):
+            shard_elems = min(max_interval_elems, total_shard_elems - first_elem)
+            pieces = self._pick_direct_pieces(shard_elems)
+            piece_elems = shard_elems // pieces
+            bf16_piece_bytes = piece_elems * 2
+            if mid_mode == "fp24":
+                lo_bytes = _align_up(piece_elems, 16)
+                mid_piece_bytes = bf16_piece_bytes + lo_bytes
+            else:
+                mid_piece_bytes = piece_elems * 4
+
+            def in_chunk_ptr(chunk: int, p: int) -> int:
+                return in_base + (chunk * total_shard_elems + first_elem + p * piece_elems) * 2
+
+            def out_chunk_ptr(chunk: int, p: int) -> int:
+                if reduce_scatter_only:
+                    return out_base + (first_elem + p * piece_elems) * 2
+                return out_base + (chunk * total_shard_elems + first_elem + p * piece_elems) * 2
+
+            def stage_ptr(parity: int, p: int) -> int:
+                return stage_base + parity * self.shard_capacity + p * mid_piece_bytes
+
+            def scratch_ptr(owner: int, step_k: int, p: int, step_bytes: int) -> int:
+                return self._scratch_ptr(owner, step_k) + p * step_bytes
+
+            def slot(step_k: int, p: int) -> int:
+                return step_k * pieces + p
+
+            self._input_ready.record(main)
+            copy_stream.wait_event(self._input_ready)
+            flag_stream.wait_event(self._input_ready)
+            if ring_stream is not main:
+                ring_stream.wait_event(self._input_ready)
+
+            for k in range(total_steps):
+                reduce_phase = k < world - 1
+                if reduce_scatter_only:
+                    send_chunk = (rank - 1 - k) % world
+                    recv_chunk = (rank - 2 - k) % world
+                elif reduce_phase:
+                    send_chunk = (rank - k) % world
+                    recv_chunk = (rank - k - 1) % world
+                else:
+                    send_chunk = (rank + 1 - (k - (world - 1))) % world
+                    recv_chunk = (rank - (k - (world - 1))) % world
+
+                for p in range(pieces):
+                    if k == 0:
+                        send_bytes = bf16_piece_bytes
+                        send_src = in_chunk_ptr(send_chunk, p)
+                        send_dst = scratch_ptr(nxt, k, p, bf16_piece_bytes)
+                    elif reduce_phase:
+                        send_bytes = mid_piece_bytes
+                        send_src = stage_ptr((k - 1) & 1, p)
+                        send_dst = scratch_ptr(nxt, k, p, mid_piece_bytes)
+                    elif k == world - 1:
+                        send_bytes = bf16_piece_bytes
+                        send_src = out_chunk_ptr(send_chunk, p)
+                        send_dst = scratch_ptr(nxt, k, p, bf16_piece_bytes)
+                    else:
+                        send_bytes = bf16_piece_bytes
+                        send_src = scratch_ptr(rank, k - 1, p, bf16_piece_bytes)
+                        send_dst = scratch_ptr(nxt, k, p, bf16_piece_bytes)
+
+                    with torch.cuda.stream(copy_stream):
+                        if k > 0:
+                            copy_stream.wait_event(add_done[p])
+                        kernels.dma_copy(send_dst, send_src, send_bytes)
+                        copied[slot(k, p)].record(copy_stream)
+                    with torch.cuda.stream(flag_stream):
+                        flag_stream.wait_event(copied[slot(k, p)])
+                        kernels.dma_set_flag(
+                            self._flag_ptr(nxt, slot(k, p)),
+                            self._counter_ptr(self._send_counters, slot(k, p)),
+                        )
+                    wait = (
+                        self._flag_ptr(rank, slot(k, p)),
+                        self._counter_ptr(self._wait_counters, slot(k, p)),
+                        self._counter_ptr(self._wait_done, slot(k, p)),
+                    )
+                    with torch.cuda.stream(ring_stream):
+                        if reduce_phase:
+                            in_m = "bf16" if k == 0 else mid_mode
+                            out_m = "bf16" if k == world - 2 else mid_mode
+                            recv_bytes = bf16_piece_bytes if k == 0 else mid_piece_bytes
+                            wire_in = scratch_ptr(rank, k, p, recv_bytes)
+                            scales_in = wire_in + bf16_piece_bytes if in_m == "fp24" else wire_in
+                            if k == world - 2:
+                                if not reduce_scatter_only and in_base == out_base and recv_chunk == rank:
+                                    ring_stream.wait_event(copied[slot(0, p)])
+                                out_ptr = out_chunk_ptr(recv_chunk, p)
+                                scales_out = out_ptr
+                            else:
+                                if k >= 2:
+                                    ring_stream.wait_event(copied[slot(k - 1, p)])
+                                out_ptr = stage_ptr(k & 1, p)
+                                scales_out = out_ptr + bf16_piece_bytes if out_m == "fp24" else out_ptr
+                            kernels.dma_direct_step(
+                                in_m,
+                                out_m,
+                                in_chunk_ptr(recv_chunk, p),
+                                wire_in,
+                                scales_in,
+                                out_ptr,
+                                scales_out,
+                                piece_elems,
+                                wait=wait,
+                            )
+                        else:
+                            if k == world - 1 and in_base == out_base:
+                                ring_stream.wait_event(copied[slot(0, p)])
+                            wire_in = scratch_ptr(rank, k, p, bf16_piece_bytes)
+                            kernels.dma_direct_wait_copy(
+                                out_chunk_ptr(recv_chunk, p),
+                                wire_in,
+                                piece_elems,
+                                wait=wait,
+                            )
+                        add_done[p].record(ring_stream)
+
+            with torch.cuda.stream(ring_stream):
+                ring_stream.wait_stream(copy_stream)
+                ring_stream.wait_stream(flag_stream)
+                kernels.dma_set_flag(
+                    self._flag_ptr(prv, done_slot),
+                    self._counter_ptr(self._send_counters, done_slot),
+                )
+                kernels.dma_wait_flag(
+                    self._flag_ptr(rank, done_slot),
+                    self._counter_ptr(self._wait_counters, done_slot),
+                )
+            if ring_stream is not main:
+                main.wait_stream(ring_stream)
+        return out
+
     @property
     def gather_capacity(self) -> int:
         """Bytes of one rank's segment that the ring all-gather carries; zero on a tree channel."""
@@ -1556,6 +1811,41 @@ class PCIeDmaAllReduce:
                 stage = self._bf16_stage.data_ptr()
                 self._kernels.dma_tree_accum(
                     stage, [stage + 64], [stage + 128], 8, False
+                )
+            if getattr(self, '_direct_mode', ''):
+                stage = self._direct_stage.data_ptr()
+                mid = self._direct_mode
+                for in_m, out_m in (("bf16", mid), (mid, mid), (mid, "bf16")):
+                    self._kernels.dma_set_flag(
+                        flag, self._counter_ptr(self._send_counters, slot)
+                    )
+                    self._kernels.dma_direct_step(
+                        in_m,
+                        out_m,
+                        stage,
+                        stage + 512,
+                        stage + 768,
+                        stage + 1024,
+                        stage + 1536,
+                        128,
+                        wait=(
+                            flag,
+                            self._counter_ptr(self._wait_counters, slot),
+                            self._counter_ptr(self._wait_done, slot),
+                        ),
+                    )
+                self._kernels.dma_set_flag(
+                    flag, self._counter_ptr(self._send_counters, slot)
+                )
+                self._kernels.dma_direct_wait_copy(
+                    stage,
+                    stage + 512,
+                    128,
+                    wait=(
+                        flag,
+                        self._counter_ptr(self._wait_counters, slot),
+                        self._counter_ptr(self._wait_done, slot),
+                    ),
                 )
             if self._fp8:
                 if self._fp8_stage is None or self._fp8_stage.numel() < 512:

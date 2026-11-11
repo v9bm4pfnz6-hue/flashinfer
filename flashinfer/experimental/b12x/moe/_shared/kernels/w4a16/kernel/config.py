@@ -120,10 +120,18 @@ def _trellis_launch_switch(name: str, size_m: int, default: str = "0") -> str:
     """
 
     scope = os.environ.get("B12X_TRELLIS_SWITCH_SCOPE", "")
-    if scope not in ("", "decode"):
-        raise ValueError("B12X_TRELLIS_SWITCH_SCOPE must be unset or decode")
-    if scope == "decode" and int(size_m) >= 128:
-        return default
+    if scope not in ("", "decode", "prefill_safe"):
+        raise ValueError(
+            "B12X_TRELLIS_SWITCH_SCOPE must be unset, decode, or prefill_safe"
+        )
+    if int(size_m) >= 128:
+        if scope == "decode":
+            return default
+        if scope == "prefill_safe" and name not in (
+            "B12X_TRELLIS_LUT_CP_ASYNC",
+            "B12X_TRELLIS_PREFETCH_SIDES",
+        ):
+            return default
     return os.environ.get(name, default)
 
 
