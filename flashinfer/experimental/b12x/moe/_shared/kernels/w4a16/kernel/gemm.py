@@ -34,6 +34,7 @@ from b12x._lib.intrinsics.packed import half2_mul
 from b12x._lib.intrinsics.packed import half2_to_float2_scaled
 from b12x._lib.intrinsics.trellis import iq2_xxs_descriptor_pair
 from b12x._lib.intrinsics.sync import ld_global_acquire_i32
+from b12x._lib.intrinsics.sync import threadfence
 from b12x._lib.intrinsics.memory import ld_global_nc_u32
 from b12x._lib.intrinsics.memory import ld_global_v4_f32
 from b12x._lib.intrinsics.atomics import ld_shared_f32
@@ -151,6 +152,7 @@ class W4A16GemmKernel:
         small_m_occupancy: int | None = None,
         small_m_splitk: bool | None = None,
         csf_inline_scales: bool = False,
+        reduction_over_stages: bool = False,
     ):
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
@@ -453,6 +455,16 @@ class W4A16GemmKernel:
         # wave count; used by the exact-geometry hybrid decode schedule.
         self.schedule_whole_tiles = bool(schedule_whole_tiles)
         self.schedule_route_block_factor = int(schedule_route_block_factor)
+        # B12X_TRELLIS_FLOW_FLAGS (set by W4A16FusedMoeKernel): 0 = off,
+        # 1 = FC1 (publish per-route-block final-tile counts), 2 = FC2 (wait
+        # for the route block's activation count before each piece).
+        self.flow_role = 0
+        self.flow_lock_offset = 0
+        self.flow_seq_off = 0
+        self.flow_ctr_off = 0
+        self.flow_max_blocks = 0
+        self.flow_live_blocks = 0
+        self.flow_act_target = 0
         if self.schedule_route_block_factor < 1:
             raise ValueError("schedule_route_block_factor must be >= 1")
         if self.schedule_route_block_factor != 1 and (
@@ -595,6 +607,17 @@ class W4A16GemmKernel:
         sh_size_max = max(sh_red_size, sh_b_size)
         sh_bias_size = self.cta_n_blocks * 16 // 8
         sh_b_red_bias_size = max(sh_size_max, sh_size_min + sh_bias_size)
+        # Opt-in prefill layout (fused table "full1", M > 16 plans only): the
+        # BF16 output / reduction tile is only live after the mainloop, when
+        # the scale and activation stages are dead too (the FP32 partial
+        # reduction already extends over them), so it may cover B + S + A
+        # instead of reserving max(red, B) before S. Frees up to
+        # red - B bytes so the 64 KiB direct table fits beside 48-row stages.
+        self.reduction_over_stages = bool(reduction_over_stages) and (
+            not self.uses_m_block_8 and not self.csf_block_inline
+        )
+        if self.reduction_over_stages:
+            sh_b_red_bias_size = sh_b_size + sh_bias_size
         self.sh_b_off = self.sh_valid_count_off
         self.sh_red_off = self.sh_valid_count_off
         self.sh_s_off = self.sh_valid_count_off + sh_b_red_bias_size
@@ -606,6 +629,8 @@ class W4A16GemmKernel:
             + _reduction_shared_bytes(self.tile_n, self.tile_k, self.uses_m_block_8)
             // 16,
         )
+        if self.reduction_over_stages:
+            self.shared_int4 = max(self.shared_int4, self.sh_red_off + sh_red_size)
         if self.csf_block_inline:
             self.csf_stage_groups = ((self.tile_n + 127) // 128) * (
                 (self.s_tb_groups + 3) // 4
@@ -693,7 +718,7 @@ class W4A16GemmKernel:
             self.trellis_direct_lut,
             self.small_m_splitk,
             self.skip_empty_m_blocks,
-        )
+        ) + (("reduction_over_stages",) if self.reduction_over_stages else ())
 
     @cute.jit
     def _activation_smem_permuted_offset(self, i: Int32) -> Int32:
@@ -987,6 +1012,14 @@ class W4A16GemmKernel:
             )
         k_tiles = Int32(self.k_tiles)
         global_mn_tiles = route_blocks * n_tiles
+        flow_live = Int32(0)
+        flow_ctr = Int64(0)
+        if cutlass.const_expr(self.flow_role != 0):
+            # Live when the route blocks fit the counter arrays (uniform
+            # across CTAs: everyone reads the same published count).
+            if route_blocks <= Int32(self.flow_live_blocks):
+                flow_live = Int32(1)
+            flow_ctr = get_ptr_as_int64(locks_i32_flat, Int32(self.flow_ctr_off))
 
         tail_mn_tiles = global_mn_tiles
         full_grid_mn_iters = Int32(0)
@@ -1141,6 +1174,19 @@ class W4A16GemmKernel:
                         lock_slot,
                     )
                 else:
+                    if cutlass.const_expr(self.flow_role == 2):
+                        # FC2 piece: its A rows are the route block's
+                        # activated rows; wait until every activation unit of
+                        # the block has published (replaces grid barrier 3).
+                        if flow_live != Int32(0):
+                            if tid == Int32(0):
+                                act_addr = flow_ctr + Int64(
+                                    self.flow_max_blocks + route_block_idx
+                                ) * Int64(4)
+                                got = Int32(-1)
+                                while got != Int32(self.flow_act_target):
+                                    got = ld_global_acquire_i32(act_addr)
+                            cute.arch.sync_threads()
                     if cutlass.const_expr(self.dense_route_fast_path):
                         expert_idx = Int32(0)
                     elif cutlass.const_expr(self.direct_topk_routes):
@@ -1172,6 +1218,18 @@ class W4A16GemmKernel:
                             lock_slot,
                             active_size_m,
                         )
+                    if cutlass.const_expr(self.flow_role == 1):
+                        # FC1: the final split-K slice stored this tile;
+                        # count it for its route block (replaces barrier 2).
+                        if flow_live != Int32(0):
+                            if reduce_slice_idx == reduce_slice_count - Int32(1):
+                                threadfence()
+                                cute.arch.sync_threads()
+                                if tid == Int32(0):
+                                    red_add_global_release_i32(
+                                        flow_ctr + Int64(route_block_idx) * Int64(4),
+                                        Int32(1),
+                                    )
 
             if has_work != Int32(0):
                 if in_tail_region == Int32(0):
@@ -2579,6 +2637,10 @@ class W4A16GemmKernel:
         tid: Int32,
     ):
         lock_addr = get_ptr_as_int64(locks_i32_flat, lock_slot)
+        if cutlass.const_expr(self.flow_lock_offset != 0):
+            lock_addr = get_ptr_as_int64(
+                locks_i32_flat, lock_slot + Int32(self.flow_lock_offset)
+            )
         if tid == Int32(0):
             state = Int32(-1)
             while state != count:
@@ -2594,6 +2656,10 @@ class W4A16GemmKernel:
         tid: Int32,
     ):
         lock_addr = get_ptr_as_int64(locks_i32_flat, lock_slot)
+        if cutlass.const_expr(self.flow_lock_offset != 0):
+            lock_addr = get_ptr_as_int64(
+                locks_i32_flat, lock_slot + Int32(self.flow_lock_offset)
+            )
         cute.arch.sync_threads()
         if tid == Int32(0):
             if reset:

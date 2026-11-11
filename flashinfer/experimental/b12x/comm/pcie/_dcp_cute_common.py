@@ -82,6 +82,107 @@ def _load_relaxed_sys_u32(
     )
 
 
+@dsl_user_op
+def _load_acquire_sys_u32(
+    ptr: cute.Pointer,
+    *,
+    loc=None,
+    ip=None,
+) -> Uint32:
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)],
+            "ld.acquire.sys.global.u32 $0, [$1];",
+            "=r,l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@cute.jit
+def _lane_in_mask(tidx, world_size: int, lane_mask: int):
+    """Whether this thread is the barrier lane of a peer in ``lane_mask`` (bit p selects peer p).
+
+    A barrier over an arbitrary peer subset stays consistent when the relation
+    is symmetric: rank a selects b in the same barriers in which b selects a.
+    """
+    selected = Int32(0)
+    for peer in cutlass.range_constexpr(world_size):
+        if cutlass.const_expr((lane_mask >> peer) & 1 == 1):
+            if Int32(tidx) == Int32(peer):
+                selected = Int32(1)
+    return selected == Int32(1)
+
+
+@cute.jit
+def block_pair_barrier_acquire(
+    signals: Sequence[cute.Pointer],
+    *,
+    self_signal: cute.Pointer,
+    rank: int,
+    world_size: int,
+    max_blocks: int,
+    lane_first: int = 0,
+    lane_count: int = -1,
+    lane_mask: int = -1,
+) -> None:
+    """``block_pair_barrier`` with the all-reduce flag scheme's consumer side.
+
+    Same records, generation and publication (system fence, then a relaxed
+    system flag store), but each lane polls its peer flag with
+    ``ld.acquire.sys``; the closing CTA barrier extends that acquire to every
+    thread, so callers need no separate ``membar.sys`` before reading the
+    peers' pushed data (pattern of ``pair_arrive_and_wait`` in the one-shot
+    all-reduce).
+    """
+    cute.arch.sync_threads()
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()
+    if cutlass.const_expr(lane_mask >= 0):
+        participate = _lane_in_mask(tidx, world_size, lane_mask)
+    elif cutlass.const_expr(lane_count < 0):
+        participate = Int32(tidx) < Int32(world_size)
+    else:
+        # Peer subset [lane_first, lane_first + lane_count): pair counters and
+        # flag slots are per (block, peer), so a subset barrier stays
+        # consistent as long as both ranks of each pair use the same subsets.
+        participate = Uint32(Int32(tidx) - Int32(lane_first)) < Uint32(lane_count)
+    if participate:
+        peer_signal_address = Int64(signals[0].toint())
+        for peer in cutlass.range_constexpr(1, world_size):
+            if Int32(tidx) == Int32(peer):
+                peer_signal_address = Int64(signals[peer].toint())
+        peer_signal = cute.make_ptr(
+            Uint32,
+            peer_signal_address,
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        )
+        _membar_sys()
+        self_index = Int64(bidx) * Int64(_MAX_RANKS) + Int64(tidx)
+        self_ptr = self_signal + self_index
+        value = Uint32(cute.arch.load(self_ptr, Uint32)) + Uint32(1)
+        cute.arch.store(self_ptr, value)
+
+        slot = Int64(value % Uint32(2))
+        common_index = Int64(max_blocks * _MAX_RANKS) + (
+            (slot * Int64(max_blocks) + Int64(bidx)) * Int64(_MAX_RANKS * _FLAG_STRIDE)
+        )
+        peer_index = common_index + Int64(rank * _FLAG_STRIDE)
+        mine_index = common_index + Int64(tidx) * Int64(_FLAG_STRIDE)
+        _store_relaxed_sys_u32(peer_signal + peer_index, value)
+        observed = _load_acquire_sys_u32(self_signal + mine_index)
+        while observed != value:
+            observed = _load_acquire_sys_u32(self_signal + mine_index)
+
+    cute.arch.sync_threads()
+
+
 @cute.jit
 def block_pair_barrier(
     signals: Sequence[cute.Pointer],
@@ -90,6 +191,9 @@ def block_pair_barrier(
     rank: int,
     world_size: int,
     max_blocks: int,
+    lane_first: int = 0,
+    lane_count: int = -1,
+    lane_mask: int = -1,
 ) -> None:
     """Match the native per-block, per-peer double-buffered barrier."""
     cute.arch.sync_threads()
@@ -100,7 +204,16 @@ def block_pair_barrier(
     # the participating lanes.  Keeping the body outside the constexpr loop
     # matches CUDA's runtime-indexed RankSignals path without cloning the
     # fence/store/poll sequence once per peer.
-    if Int32(tidx) < Int32(world_size):
+    if cutlass.const_expr(lane_mask >= 0):
+        participate = _lane_in_mask(tidx, world_size, lane_mask)
+    elif cutlass.const_expr(lane_count < 0):
+        participate = Int32(tidx) < Int32(world_size)
+    else:
+        # Peer subset [lane_first, lane_first + lane_count): pair counters and
+        # flag slots are per (block, peer), so a subset barrier stays
+        # consistent as long as both ranks of each pair use the same subsets.
+        participate = Uint32(Int32(tidx) - Int32(lane_first)) < Uint32(lane_count)
+    if participate:
         peer_signal_address = Int64(signals[0].toint())
         for peer in cutlass.range_constexpr(1, world_size):
             if Int32(tidx) == Int32(peer):
@@ -139,4 +252,4 @@ def signal_bytes(max_blocks: int) -> int:
     return (max_blocks * _MAX_RANKS + 2 * max_blocks * _MAX_RANKS * _FLAG_STRIDE) * 4
 
 
-__all__ = ["block_pair_barrier", "signal_bytes"]
+__all__ = ["block_pair_barrier", "block_pair_barrier_acquire", "signal_bytes"]

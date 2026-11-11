@@ -120,6 +120,7 @@ def _configs(query, device=None):
                 "remote_push_simple",
                 "remote_push_full",
                 "remote_push_rsag",
+                "remote_push_rsag_side",
             )
         ):
             from .pcie_oneshot import _MAX_BLOCKS
@@ -212,6 +213,7 @@ def _efficient_plain_grid(query, value):
         "remote_push_simple",
         "remote_push_full",
         "remote_push_rsag",
+        "remote_push_rsag_side",
     ):
         return True
     call = query.alternatives[name]["call"]
@@ -563,6 +565,9 @@ def oneshot_alternatives(query, runtime):
             <= int(query.setup["eager_storage_shards"]) * capacity
         ):
             modes += ["remote_push_full", "remote_push_rsag"]
+            if query.world_size == 9:
+                # The reduce-scatter whose results cross between the two sides once.
+                modes.append("remote_push_rsag_side")
             if query.setup.get("joint_max_blocks", 0) > 0:
                 modes += list(JOINT_FAMILIES)
     elif query.world_size == 4:
@@ -581,7 +586,11 @@ def oneshot_alternatives(query, runtime):
             "remote_push_simple",
         ):
             call.update(threads=128, blocks=min(36, -(-call["size_packs"] // 128)))
-        if field == "transport" and mode in ("remote_push_full", "remote_push_rsag"):
+        if field == "transport" and mode in (
+            "remote_push_full",
+            "remote_push_rsag",
+            "remote_push_rsag_side",
+        ):
             call.update(threads=256, blocks=16)
         if mode in JOINT_FAMILIES:
             call.update(

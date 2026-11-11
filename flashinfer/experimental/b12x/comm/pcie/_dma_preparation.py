@@ -43,6 +43,10 @@ def query_from_runtime(runtime, *, surface: str, call) -> PcieQuery:
             "bf16_gather": bool(runtime._bf16_gather),
             "pieces_override": int(runtime._pieces_override),
             "a2a_chunks_override": int(runtime._a2a_chunks_override),
+            # Present only for a tree channel, so ring queries keep their identity.
+            **({"tree": str(runtime.tree)} if getattr(runtime, "tree", None) else {}),
+            # Present only when the first reduce hop carries BF16 values.
+            **({"bf16_first_hop": True} if getattr(runtime, "_bf16_first_hop", False) else {}),
             **dict(call),
         }
     )
@@ -75,7 +79,9 @@ def query_from_runtime(runtime, *, surface: str, call) -> PcieQuery:
             "flag_slots": 256,
             "flag_stride": 128,
             "steps": 2 * (int(runtime.world_size) - 1),
-            "slab_nbytes": 256 * 128
+            "slab_nbytes": int(runtime._slab_nbytes)
+            if getattr(runtime, "tree", None)
+            else 256 * 128
             + 2 * (int(runtime.world_size) - 1) * int(runtime.shard_capacity),
             "stage_nbytes": 0
             if runtime._fp8_stage is None
@@ -84,6 +90,11 @@ def query_from_runtime(runtime, *, surface: str, call) -> PcieQuery:
             "bf16_stage_nbytes": 0
             if runtime._bf16_stage is None
             else int(runtime._bf16_stage.numel()),
+            **(
+                {"tree_stage_nbytes": int(runtime._tree_stage.numel())}
+                if getattr(runtime, "tree", None)
+                else {}
+            ),
         }
     )
     return PcieQuery(
@@ -140,6 +151,43 @@ def query_from_metadata(
     )
 
 
+def gather_query_from_metadata(
+    runtime, *, shape: tuple[int, ...], dtype: torch.dtype
+) -> PcieQuery:
+    """Snapshot a ring all-gather of one `shape` segment per rank on a DMA channel.
+
+    The gather runs the channel's copy and flag programs, so its plan compiles what a reduction's
+    plan compiles; the operation and the segment are part of the query, not of the code.
+    """
+    if not shape or any(type(extent) is not int or extent <= 0 for extent in shape):
+        raise ValueError("DMA gather metadata requires a positive shape")
+    count = 1
+    for extent in shape:
+        count *= extent
+    nbytes = count * dtype.itemsize
+    if nbytes % 16 or nbytes > int(runtime.gather_capacity):
+        raise ValueError(
+            "DMA gather segments are whole 16-byte packs within the ring's shard capacity"
+        )
+    return query_from_runtime(
+        runtime,
+        surface=_SURFACE,
+        call=FrozenMapping(
+            {
+                "operation": "all_gather",
+                "shape": tuple(shape),
+                "dtype": str(dtype).removeprefix("torch."),
+            }
+        ),
+    )
+
+
+def accumulate_variants(call, tree=()) -> tuple:
+    """Accumulate kernels of a channel: a tree's schedule variants, and for a ring whose first
+    reduce hop carries BF16 the sum of one BF16 piece and one FP32 partial stored as FP32."""
+    return tuple(tree) + (((1, 1, False),) if call.get("bf16_first_hop") else ())
+
+
 @program_cache(scope="preparation")
 def compile_dma_surface(query_payload, ordinal: int) -> DmaLaunchers:
     """Compiler-pool factory using only query metadata and native factories."""
@@ -148,9 +196,20 @@ def compile_dma_surface(query_payload, ordinal: int) -> DmaLaunchers:
 
     query = PcieQuery(**dict(query_payload))
     values = _require(query.call, "wire_mode")
+    variants = ()
+    if values.get("tree"):
+        from ._dma_tree import schedule, topology
+
+        routing = topology(str(values["tree"]))
+        variants = tuple(
+            sorted({variant for pieces in (1, 2, 4) for variant in schedule(routing, pieces).variants})
+        )
+    variants = accumulate_variants(values, variants)
     with torch.cuda.device(int(ordinal)):
         return compile_launchers(
-            world_size=query.world_size, wire_mode=str(values["wire_mode"])
+            world_size=query.world_size,
+            wire_mode=str(values["wire_mode"]),
+            tree_variants=variants,
         )
 
 
@@ -171,6 +230,22 @@ class _DmaExecutionState:
 
     def run(self, inp, *, out=None):
         return self.runtime._run_prepared(inp, out=out, state=self)
+
+    def run_gather(self, slots):
+        """Ring all-gather into the runtime's gather_slots view; release_gather ends it."""
+        self.require_runtime(self.runtime)
+        torch.cuda.set_device(self.runtime.device)
+        self.runtime._run_gather(self.runtime._gather_segment_bytes(slots))
+        return slots
+
+    def release_gather(self) -> None:
+        self.runtime._release_gather()
+
+    def prime_gather(self, slots) -> None:
+        """Load the channel's kernels before the first gather waits on a flag, then gather once."""
+        self.runtime._prime_prepared(self)
+        self.run_gather(slots)
+        self.release_gather()
 
     def prime(self, inp, *, out) -> None:
         """Prime the actual caller-owned collective transport after loading code."""
@@ -231,6 +306,7 @@ def plan(
             int(query.setup["slab_nbytes"])
             + int(query.setup["stage_nbytes"])
             + int(query.setup["bf16_stage_nbytes"])
+            + int(query.setup.get("tree_stage_nbytes", 0))
             + 3 * int(query.setup["flag_slots"]) * 4
         )
         # The runtime owns its IPC slab/stage before declaration; preparation
@@ -265,4 +341,4 @@ def plan(
     )
 
 
-__all__ = ["plan", "prepared_call", "query_from_runtime"]
+__all__ = ["gather_query_from_metadata", "plan", "prepared_call", "query_from_runtime"]

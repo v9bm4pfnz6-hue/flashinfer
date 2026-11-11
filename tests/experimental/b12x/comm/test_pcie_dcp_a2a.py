@@ -300,11 +300,298 @@ def test_lse_compile_factory_retains_program_identity(monkeypatch) -> None:
     assert program_keys(launcher) == (program,)
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_lse_tp8_push_switch_selects_transport_and_compile_identity(
+    monkeypatch, enabled: bool
+) -> None:
+    from b12x._lib.compile_plan import ProgramKey
+    from b12x.comm.pcie import _dcp_a2a_cute as kernels
+
+    if enabled:
+        monkeypatch.setenv("B12X_PCIE_DCP_LSE_PUSH_TP8", "1")
+    else:
+        monkeypatch.delenv("B12X_PCIE_DCP_LSE_PUSH_TP8", raising=False)
+    compiled = []
+
+    def fake_compile(launch, *args, compile_spec, **kwargs):
+        def raw(*a, **k):
+            return None
+
+        raw.__b12x_programs__ = (ProgramKey("cute", "test", "dcp-lse-push"),)
+        compiled.append((launch, compile_spec))
+        return raw
+
+    monkeypatch.setattr(kernels, "b12x_compile", fake_compile)
+    monkeypatch.setattr(
+        kernels,
+        "raise_if_kernel_resolution_frozen",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(kernels, "_u32_ptr", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(kernels, "_f32_ptr", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(kernels, "_u8_ptr", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(kernels, "current_cuda_stream", lambda: 0)
+
+    for world in (2, 4, 8, 16):
+        kernels._get_compiled_lse_reduce_scatter.__wrapped__(
+            world, 0, "bf16", 512, True
+        )
+    push = {launch._world_size: launch._push for launch, _ in compiled}
+    indexed = {launch._world_size: launch._indexed_push for launch, _ in compiled}
+    assert push == {2: True, 4: True, 8: enabled, 16: False}
+    assert indexed == {2: False, 4: True, 8: enabled, 16: False}
+    specs = {launch._world_size: spec for launch, spec in compiled}
+    assert ("tp8_transport" in specs[8].json_key) is enabled
+    for world in (2, 4, 16):
+        assert "tp8_transport" not in specs[world].json_key
+    assert kernels.is_lse_reduce_scatter_prepared(8, 0, "bf16", 512, True)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_lse_tp9_push_switch_selects_transport_order_and_compile_identity(
+    monkeypatch, enabled: bool
+) -> None:
+    from b12x._lib.compile_plan import ProgramKey
+    from b12x.comm.pcie import _dcp_a2a_cute as kernels
+
+    monkeypatch.delenv("B12X_PCIE_DCP_LSE_PUSH_TP8", raising=False)
+    if enabled:
+        monkeypatch.setenv("B12X_PCIE_DCP_LSE_PUSH_TP9", "1")
+    else:
+        monkeypatch.delenv("B12X_PCIE_DCP_LSE_PUSH_TP9", raising=False)
+    compiled = []
+
+    def fake_compile(launch, *args, compile_spec, **kwargs):
+        def raw(*a, **k):
+            return None
+
+        raw.__b12x_programs__ = (ProgramKey("cute", "test", "dcp-lse-push-tp9"),)
+        compiled.append((launch, compile_spec))
+        return raw
+
+    monkeypatch.setattr(kernels, "b12x_compile", fake_compile)
+    monkeypatch.setattr(
+        kernels,
+        "raise_if_kernel_resolution_frozen",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(kernels, "_u32_ptr", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(kernels, "_f32_ptr", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(kernels, "_u8_ptr", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(kernels, "current_cuda_stream", lambda: 0)
+
+    for world, rank in ((8, 0), (9, 0), (9, 5), (10, 0)):
+        kernels._get_compiled_lse_reduce_scatter.__wrapped__(
+            world, rank, "bf16", 512, True
+        )
+    by = {(launch._world_size, launch._rank): (launch, spec) for launch, spec in compiled}
+    # The TP9 switch leaves every other world on its default transport.
+    assert not by[(8, 0)][0]._push and not by[(10, 0)][0]._push
+    for rank in (0, 5):
+        launch, spec = by[(9, rank)]
+        assert launch._push is enabled and launch._indexed_push is enabled
+        assert ("tp9_transport" in spec.json_key) is enabled
+        if enabled:
+            # A rotation: step s of every rank targets a different destination.
+            assert launch._destination_order == tuple((rank + s) % 9 for s in range(9))
+        else:
+            assert launch._destination_order == tuple(range(9))
+    if enabled:
+        for step in range(9):
+            assert len({(rank + step) % 9 for rank in range(9)}) == 9
+
+
+@pytest.mark.parametrize("world", [8, 9])
+def test_pushed_kimi_pair_accepts_padded_shards_and_passes_their_packs(
+    monkeypatch, world: int
+) -> None:
+    from types import SimpleNamespace
+
+    from b12x.comm.pcie import pcie_dcp_a2a as runtime_module
+
+    down = -(-3584 // world)
+    down += -down % 32
+    router = -(-896 // world)
+    router += -router % 8
+    runtime = runtime_module.PCIeDCPA2A.__new__(runtime_module.PCIeDCPA2A)
+    runtime.device = torch.device("cpu")
+    runtime.world_size, runtime.rank = world, 0
+    runtime.max_batch_size = 32
+    runtime.query_head_dim = 2 * down + 4 * router
+    runtime._closed = False
+    runtime._device_slot_selection = False
+    runtime._next_slot = 0
+    runtime._graph_base_slot = 0
+    runtime._slot_bytes = 1 << 20
+    runtime._check_stream = lambda: None
+    launched = []
+    runtime._launch_all_gather_pair_kimi_topk = lambda *args, **kwargs: launched.append(kwargs)
+    monkeypatch.setattr(runtime_module, "_is_current_stream_capturing", lambda device: False)
+    push = SimpleNamespace(
+        query=SimpleNamespace(call={"pair_transport": "push"}), launcher=lambda slot: None
+    )
+
+    def call(rows, down_width=down, router_width=router, state=push):
+        return runtime._all_gather_pair_kimi_topk_on_device(
+            torch.zeros((rows, down_width), dtype=torch.bfloat16),
+            torch.zeros((rows, router_width), dtype=torch.float32),
+            torch.zeros(896, dtype=torch.float32),
+            None,
+            None,
+            None,
+            state=state,
+        )
+
+    out_down, weights, ids = call(4)
+    assert out_down.shape == (4, 3584) and weights.shape == (4, 16) and ids.shape == (4, 16)
+    if world == 9:
+        # 416 BF16 columns and 104 FP32 columns per rank: 52 and 26 packs.
+        assert (down, router) == (416, 104)
+        assert launched[-1]["down_packs"] == 52 and launched[-1]["router_packs"] == 26
+        assert launched[-1]["rows"] == 4
+        for bad in (dict(down_width=down + 32), dict(router_width=router + 8), dict(down_width=400)):
+            with pytest.raises(ValueError, match="padded Kimi paired gather|must be contiguous"):
+                call(4, **bad)
+        # The pull kernel reads exact shards only.
+        pull = SimpleNamespace(query=SimpleNamespace(call={}), launcher=lambda slot: None)
+        with pytest.raises(ValueError, match="must be contiguous"):
+            call(1, state=pull)
+    else:
+        assert "down_packs" not in launched[-1]
+    with pytest.raises(ValueError, match="rows exceed"):
+        call(9)
+
+
+def test_pair_gather_roles_deliver_every_segment_with_symmetric_barriers() -> None:
+    """Emulate the nine-rank pair gather: pushes, first barrier, in-pair forwards, second barrier."""
+    from b12x.comm.pcie._dcp_a2a_cute import pair_gather_roles
+
+    roles = {rank: pair_gather_roles(rank) for rank in range(9)}
+    staging = {rank: set() for rank in range(9)}
+    for rank, role in roles.items():
+        assert rank not in role["direct"] and len(set(role["direct"])) == len(role["direct"])
+        for peer in role["direct"]:
+            staging[peer].add(rank)
+    for rank, role in roles.items():
+        # The relation of the first barrier is symmetric and covers every rank that pushed here.
+        assert all(rank in roles[peer]["first"] for peer in role["first"])
+        assert {source for source in range(9) if rank in roles[source]["direct"]} <= set(role["first"])
+        # What a rank forwards has been pushed to it and is not pushed to its partner by the source.
+        for source in role["forwarded"]:
+            assert rank in roles[source]["direct"] and role["partner"] not in roles[source]["direct"]
+    forwarded = {rank: set() for rank in range(9)}
+    for rank, role in roles.items():
+        if role["partner"] is not None:
+            assert roles[role["partner"]]["partner"] == rank
+            forwarded[role["partner"]] |= set(role["forwarded"])
+    for rank in range(9):
+        assert not staging[rank] & forwarded[rank]
+        assert staging[rank] | forwarded[rank] == set(range(9)) - {rank}
+    # Copies that leave or enter a pair, and copies that cross between ranks 0-3,8 and ranks 4-7.
+    side = lambda rank: 1 if 4 <= rank < 8 else 0
+    pushes = [(rank, peer) for rank, role in roles.items() for peer in role["direct"]]
+    for pair in range(4):
+        members = {2 * pair, 2 * pair + 1}
+        assert sum(a in members and b not in members for a, b in pushes) == 8
+        assert sum(a not in members and b in members for a, b in pushes) == 7
+    assert sum(side(a) == 0 and side(b) == 1 for a, b in pushes) == 10
+    assert sum(side(a) == 1 and side(b) == 0 for a, b in pushes) == 12
+    with pytest.raises(ValueError, match="ranks 0 to 8"):
+        pair_gather_roles(9)
+
+
+def test_side_entry_gather_roles_deliver_every_segment_with_one_crossing() -> None:
+    """Emulate the nine-rank side-entry gather phase by phase and count the copies on every link."""
+    import collections
+
+    from b12x.comm.pcie._dcp_a2a_cute import SIDE_ENTRY_RANKS, side_entry_gather_roles
+
+    roles = {rank: side_entry_gather_roles(rank) for rank in range(9)}
+    assert all(len(role) == 3 for role in roles.values())
+    side = lambda rank: 1 if 4 <= rank < 8 else 0
+    leaf = lambda rank: 4 if rank == 8 else rank // 2
+    held = {rank: {rank} for rank in range(9)}
+    crossings = collections.Counter()
+    total, busiest = collections.Counter(), []
+    for phase in range(3):
+        arrived = []
+        load = collections.Counter()
+        for rank, role in roles.items():
+            pushes, mask = role[phase]
+            # Symmetric barriers: a peer of this phase names this rank in the same phase.
+            assert all(roles[peer][phase][1] >> rank & 1 for peer in range(9) if mask >> peer & 1)
+            assert mask == sum(1 << peer for peer in {child for _, child in pushes}
+                               | {sender for sender in range(9) if any(
+                                   child == rank for _, child in roles[sender][phase][0])})
+            for source, child in pushes:
+                # A rank pushes its own segment first and forwards only what an earlier phase delivered.
+                assert source in held[rank] and child != rank
+                assert (source == rank) == (phase == 0)
+                arrived.append((child, source))
+                crossings[source] += side(rank) != side(child)
+                links = [("up", rank), ("down", child)]
+                if leaf(rank) != leaf(child):
+                    links += [("leaf-up", leaf(rank))] * (rank != 8) + [("leaf-down", leaf(child))] * (child != 8)
+                    if side(rank) != side(child):
+                        links.append(("cross", side(rank)))
+                for link in links:
+                    load[link] += 1
+                    total[link] += 1
+        for child, source in arrived:
+            # Every segment reaches a rank once.
+            assert source not in held[child]
+            held[child].add(source)
+        busiest.append(max(load.values()))
+    assert all(held[rank] == set(range(9)) for rank in range(9))
+    # One copy of every segment crosses between ranks 0-3,8 and ranks 4-7, where the pair gather sends 10 and 12.
+    assert all(crossings[source] == 1 for source in range(9))
+    assert total[("cross", 0)] == 5 and total[("cross", 1)] == 4
+    assert all(side(SIDE_ENTRY_RANKS[source]) != side(source) for source in range(9))
+    # Copies on the busiest link of each phase, and on the busiest link over the whole gather.
+    assert busiest == [6, 5, 2] and max(total.values()) == 9
+    with pytest.raises(ValueError, match="ranks 0 to 8"):
+        side_entry_gather_roles(9)
+
+
+def test_side_entry_gather_switch_names_a_world_9_design_and_its_launcher(monkeypatch) -> None:
+    from b12x.comm.pcie import _dcp_a2a_cute as kernels
+
+    monkeypatch.delenv(kernels.GATHER_ISLAND_ENV, raising=False)
+    assert kernels.gather_island_design(9) is False
+    monkeypatch.setenv(kernels.GATHER_ISLAND_ENV, "1")
+    assert kernels.gather_island_design(8) is True and kernels.gather_island_design(9) is True
+    monkeypatch.setenv(kernels.GATHER_ISLAND_ENV, "2")
+    assert kernels.gather_island_design(8) is True and kernels.gather_island_design(9) == "side-entry"
+    assert kernels.gather_island_design(16) is False
+    assert [kernels.gather_island_argument(value) for value in (None, "island", "side-entry", "other")] == [
+        False, True, "side-entry", False]
+    plain = kernels._gather_launcher_key(9, 3, 256, True)
+    pairs = kernels._gather_launcher_key(9, 3, 256, True, False, True)
+    routed = kernels._gather_launcher_key(9, 3, 256, True, False, "side-entry")
+    assert pairs == plain + ("island",) and routed == plain + ("island", "side-entry")
+    assert kernels._gather_launcher_key(9, 3, 256, True, True, "side-entry") == plain + (
+        "acquire", "island", "side-entry")
+    with pytest.raises(ValueError, match="world_size 9"):
+        kernels._get_compiled_all_gather_heads.__wrapped__(8, 0, 256, True, False, "side-entry")
+
+
+def test_island_gather_switch_covers_worlds_8_and_9(monkeypatch) -> None:
+    from b12x.comm.pcie import _dcp_a2a_cute as kernels
+
+    monkeypatch.delenv(kernels.GATHER_ISLAND_ENV, raising=False)
+    assert not any(kernels.gather_island_enabled(world) for world in (2, 4, 8, 9, 16))
+    monkeypatch.setenv(kernels.GATHER_ISLAND_ENV, "1")
+    assert [kernels.gather_island_enabled(world) for world in (2, 4, 8, 9, 10, 16)] == [
+        False, False, True, True, False, False]
+
+
 def test_block_pair_barrier_selects_once_and_keeps_scaled_offsets_int64() -> None:
     from b12x.comm.pcie import _dcp_cute_common as common
 
     source = inspect.getsource(common.block_pair_barrier)
-    prefix, body = source.split("if Int32(tidx) < Int32(world_size):", maxsplit=1)
+    prefix, body = source.split("    if participate:", maxsplit=1)
+    # Default (no peer subset) keeps the original lane predicate.
+    assert "participate = Int32(tidx) < Int32(world_size)" in prefix
     assert "for peer in cutlass.range_constexpr(1, world_size):" not in prefix
     assert "for peer in cutlass.range_constexpr(1, world_size):" in body
     assert "peer_signal_address = Int64(signals[peer].toint())" in body

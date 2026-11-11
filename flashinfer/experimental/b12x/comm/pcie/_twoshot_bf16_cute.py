@@ -31,12 +31,14 @@ from b12x._lib.intrinsics.memory import (
     ld_global_nc_v4_u32,
     ld_global_v4_u32,
     st_global_v4_u32,
+    u32_as_f32,
 )
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils.device import current_cuda_stream
 from b12x._lib.utils.pointers import make_ptr
 
 from ._cute_intrinsics import (
+    f32_as_u32,
     graph_epoch_arrive_serialized,
     ld_relaxed_gpu_u32,
     pack_f32x2_to_bf16x2,
@@ -1192,3 +1194,1012 @@ def get_twoshot_bf16_allreduce_launcher(
 
 
 __all__ = ["get_twoshot_bf16_launcher", "get_twoshot_bf16_allreduce_launcher"]
+
+
+class _TwoShotIslandAllReduceLaunch(_TwoShotBf16Launch):
+    """Single-launch 2-island hierarchical BF16 all-reduce for world size 8.
+
+    Topology contract (B12X_PCIE_TWOSHOT_ISLAND): ranks 0-3 share one PCIe
+    switch (island A), ranks 4-7 the other (island B), and rank ``r``'s
+    cross-island partner is ``r ^ 4``. Only partner pairs cross the island
+    uplink, once, carrying each island's FP32 partial for one quarter.
+
+    Quarter ``q`` (``shard_packs`` = total/4 packs) is owned by island-local
+    rank ``q`` in both islands. Phases, each followed by the per-CTA barrier
+    (block ``b`` pairs only with block ``b`` of every peer, and every phase
+    walks the same quarter-local pack indices):
+
+    1. push quarter ``m`` of the payload into island peer ``m``'s staging
+       region ``local`` (posted writes, island-local only);
+    2. FP32 island partial of the owned quarter, summed in island-local rank
+       order 0..3 over the original BF16 inputs; written as FP32 into this
+       rank's own output (low half into quarter ``local``, high half into
+       quarter ``local + 1``; both are overwritten later);
+    3. push the FP32 partial (or its BF16 rounding when ``wire_bf16``) into
+       the partner's staging regions 0 (low half) and 1 (high half) at the
+       same 16-byte pack index, so every CTA touches only its own packs;
+    4. final = own partial + partner partial (two-term FP32 sums are
+       commutative, so both partners round the identical value), rounded once
+       to BF16 into the owned output quarter;
+    5. push the owned quarter into the island peers' staging region ``local``;
+       after the barrier, copy the three received quarters into the output.
+
+    All eight ranks therefore hold bitwise-identical results. Staging use stays
+    within the push two-shot slot (4 regions of 2*pack_stride packs).
+    """
+
+    def __init__(
+        self,
+        world_size: int,
+        rank: int,
+        device_slot_selection: bool,
+        slot_bias: int,
+        threads: int,
+        row_elems: int,
+        wire_bf16: bool = False,
+    ) -> None:
+        if int(world_size) != 8:
+            raise ValueError("island two-shot all-reduce requires world size 8")
+        super().__init__(
+            "reduce_scatter",  # barrier addressing uses the dynamic-rank path
+            world_size,
+            rank,
+            device_slot_selection,
+            slot_bias,
+            threads,
+            row_elems,
+        )
+        self._wire_bf16 = bool(wire_bf16)
+
+    @cute.jit
+    def _final_store_bf16(self, address: Int64, values: cute.Tensor) -> None:
+        st_global_v4_u32(
+            address,
+            pack_f32x2_to_bf16x2(values[0], values[1]),
+            pack_f32x2_to_bf16x2(values[2], values[3]),
+            pack_f32x2_to_bf16x2(values[4], values[5]),
+            pack_f32x2_to_bf16x2(values[6], values[7]),
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        payload: cute.Pointer,
+        staging0: cute.Pointer,
+        staging1: cute.Pointer,
+        staging2: cute.Pointer,
+        staging3: cute.Pointer,
+        staging4: cute.Pointer,
+        staging5: cute.Pointer,
+        staging6: cute.Pointer,
+        staging7: cute.Pointer,
+        staging8: cute.Pointer,
+        staging9: cute.Pointer,
+        staging10: cute.Pointer,
+        staging11: cute.Pointer,
+        staging12: cute.Pointer,
+        staging13: cute.Pointer,
+        staging14: cute.Pointer,
+        staging15: cute.Pointer,
+        signal0: cute.Pointer,
+        signal1: cute.Pointer,
+        signal2: cute.Pointer,
+        signal3: cute.Pointer,
+        signal4: cute.Pointer,
+        signal5: cute.Pointer,
+        signal6: cute.Pointer,
+        signal7: cute.Pointer,
+        signal8: cute.Pointer,
+        signal9: cute.Pointer,
+        signal10: cute.Pointer,
+        signal11: cute.Pointer,
+        signal12: cute.Pointer,
+        signal13: cute.Pointer,
+        signal14: cute.Pointer,
+        signal15: cute.Pointer,
+        output: cute.Pointer,
+        rank: Int32,
+        pack_stride: Int64,
+        slot_bytes: Int64,
+        shard_packs: Int64,
+        total_packs: Int64,
+    ) -> None:
+        staging = (
+            staging0,
+            staging1,
+            staging2,
+            staging3,
+            staging4,
+            staging5,
+            staging6,
+            staging7,
+            staging8,
+            staging9,
+            staging10,
+            staging11,
+            staging12,
+            staging13,
+            staging14,
+            staging15,
+        )
+        signals = (
+            signal0,
+            signal1,
+            signal2,
+            signal3,
+            signal4,
+            signal5,
+            signal6,
+            signal7,
+            signal8,
+            signal9,
+            signal10,
+            signal11,
+            signal12,
+            signal13,
+            signal14,
+            signal15,
+        )
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        gdim, _, _ = cute.arch.grid_dim()
+        island_base = self._rank & 4
+        local = self._rank & 3
+        partner = self._rank ^ 4
+        next_local = (local + 1) & 3
+        # shard_packs = packs per quarter (total_packs = 4 * shard_packs).
+        chunk = (shard_packs + Int64(gdim) - Int64(1)) // Int64(gdim)
+        begin = Int64(bidx) * chunk
+        end = begin + chunk
+        if end > shard_packs:
+            end = shard_packs
+        region_bytes = Int64(2) * pack_stride * Int64(16)
+
+        payload_address = Int64(payload.toint())
+        output_address = Int64(output.toint())
+        staging_slot_offset = Int64(0)
+        if cutlass.const_expr(self._device_slot_selection):
+            self_signal = Int64(signals[self._rank].toint())
+            generation = ld_relaxed_gpu_u32(self_signal + Int64(_GRAPH_EPOCH_OFFSET))
+            staging_slot_offset = (
+                Int64((generation + Uint32(self._slot_bias)) % Uint32(2)) * slot_bytes
+            )
+            cute.arch.barrier()
+            if Int32(tidx) == Int32(self._threads - 1):
+                graph_epoch_arrive_serialized(
+                    self_signal + Int64(_GRAPH_EPOCH_OFFSET),
+                    self_signal + Int64(_GRAPH_BLOCKS_ARRIVED_OFFSET),
+                    Uint32(gdim),
+                )
+        self_base = Int64(staging[self._rank].toint()) + staging_slot_offset
+        partner_base = Int64(staging[partner].toint()) + staging_slot_offset
+
+        # Phase 1: island reduce-scatter pushes (rank-staggered, local peers only).
+        for step in cutlass.range_constexpr(1, 4):
+            peer_local = (local + step) & 3
+            destination = (
+                Int64(staging[island_base + peer_local].toint())
+                + staging_slot_offset
+                + Int64(local) * region_bytes
+            )
+            source = payload_address + Int64(peer_local) * shard_packs * Int64(16)
+            index = begin + Int64(tidx)
+            while index < end:
+                words = ld_global_nc_v4_u32(source + index * Int64(16))
+                _st_generic_v4_u32(
+                    destination + index * Int64(16),
+                    words[0],
+                    words[1],
+                    words[2],
+                    words[3],
+                )
+                index += Int64(self._threads)
+        self._barrier(signals, rank)
+
+        # Phase 2: FP32 island partial of the owned quarter, fixed order 0..3.
+        own_low = output_address + Int64(local) * shard_packs * Int64(16)
+        own_high = output_address + Int64(next_local) * shard_packs * Int64(16)
+        index = begin + Int64(tidx)
+        while index < end:
+            accumulator = cute.make_rmem_tensor((_PACK_ELEMS,), cutlass.Float32)
+            for source_local in cutlass.range_constexpr(4):
+                if cutlass.const_expr(source_local == local):
+                    words = ld_global_nc_v4_u32(
+                        payload_address
+                        + (Int64(local) * shard_packs + index) * Int64(16)
+                    )
+                else:
+                    words = _ld_generic_v4_u32(
+                        self_base
+                        + Int64(source_local) * region_bytes
+                        + index * Int64(16)
+                    )
+                self._accumulate_words(accumulator, words, source_local == 0)
+            if cutlass.const_expr(self._wire_bf16):
+                packed = cute.make_rmem_tensor((4,), Uint32)
+                for word in cutlass.range_constexpr(4):
+                    packed[word] = pack_f32x2_to_bf16x2(
+                        accumulator[word * 2], accumulator[word * 2 + 1]
+                    )
+                st_global_v4_u32(
+                    own_low + index * Int64(16), packed[0], packed[1], packed[2], packed[3]
+                )
+            else:
+                st_global_v4_u32(
+                    own_low + index * Int64(16),
+                    f32_as_u32(accumulator[0]),
+                    f32_as_u32(accumulator[1]),
+                    f32_as_u32(accumulator[2]),
+                    f32_as_u32(accumulator[3]),
+                )
+                st_global_v4_u32(
+                    own_high + index * Int64(16),
+                    f32_as_u32(accumulator[4]),
+                    f32_as_u32(accumulator[5]),
+                    f32_as_u32(accumulator[6]),
+                    f32_as_u32(accumulator[7]),
+                )
+            index += Int64(self._threads)
+        self._barrier(signals, rank)
+
+        # Phase 3: one cross-island push of the partial to the partner.
+        index = begin + Int64(tidx)
+        while index < end:
+            low = ld_global_v4_u32(own_low + index * Int64(16))
+            if cutlass.const_expr(self._wire_bf16):
+                _st_generic_v4_u32(
+                    partner_base + index * Int64(16), low[0], low[1], low[2], low[3]
+                )
+            else:
+                high = ld_global_v4_u32(own_high + index * Int64(16))
+                _st_generic_v4_u32(
+                    partner_base + index * Int64(16), low[0], low[1], low[2], low[3]
+                )
+                _st_generic_v4_u32(
+                    partner_base + region_bytes + index * Int64(16),
+                    high[0],
+                    high[1],
+                    high[2],
+                    high[3],
+                )
+            index += Int64(self._threads)
+        self._barrier(signals, rank)
+
+        # Phase 4: final = own + partner (commutative two-term FP32 sum), one rounding.
+        index = begin + Int64(tidx)
+        while index < end:
+            total = cute.make_rmem_tensor((_PACK_ELEMS,), cutlass.Float32)
+            if cutlass.const_expr(self._wire_bf16):
+                mine = ld_global_v4_u32(own_low + index * Int64(16))
+                theirs = _ld_generic_v4_u32(self_base + index * Int64(16))
+                self._accumulate_words(total, mine, True)
+                self._accumulate_words(total, theirs)
+            else:
+                mine_low = ld_global_v4_u32(own_low + index * Int64(16))
+                mine_high = ld_global_v4_u32(own_high + index * Int64(16))
+                theirs_low = _ld_generic_v4_u32(self_base + index * Int64(16))
+                theirs_high = _ld_generic_v4_u32(
+                    self_base + region_bytes + index * Int64(16)
+                )
+                for lane in cutlass.range_constexpr(4):
+                    total[lane] = u32_as_f32(mine_low[lane]) + u32_as_f32(
+                        theirs_low[lane]
+                    )
+                    total[lane + 4] = u32_as_f32(mine_high[lane]) + u32_as_f32(
+                        theirs_high[lane]
+                    )
+            self._final_store_bf16(own_low + index * Int64(16), total)
+            index += Int64(self._threads)
+        self._barrier(signals, rank)
+
+        # Phase 5: island all-gather pushes of the owned quarter.
+        for step in cutlass.range_constexpr(1, 4):
+            peer_local = (local + step) & 3
+            destination = (
+                Int64(staging[island_base + peer_local].toint())
+                + staging_slot_offset
+                + Int64(local) * region_bytes
+            )
+            index = begin + Int64(tidx)
+            while index < end:
+                words = ld_global_v4_u32(own_low + index * Int64(16))
+                _st_generic_v4_u32(
+                    destination + index * Int64(16),
+                    words[0],
+                    words[1],
+                    words[2],
+                    words[3],
+                )
+                index += Int64(self._threads)
+        self._barrier(signals, rank)
+        for step in cutlass.range_constexpr(1, 4):
+            source_local = (local + step) & 3
+            source = self_base + Int64(source_local) * region_bytes
+            destination = output_address + Int64(source_local) * shard_packs * Int64(16)
+            index = begin + Int64(tidx)
+            while index < end:
+                words = _ld_generic_v4_u32(source + index * Int64(16))
+                st_global_v4_u32(
+                    destination + index * Int64(16),
+                    words[0],
+                    words[1],
+                    words[2],
+                    words[3],
+                )
+                index += Int64(self._threads)
+
+
+_ISLAND_OVERLAP_STAGES = 8  # quarter sub-chunks in the software pipeline
+_ISLAND_OVERLAP_AREA_UNITS = 10  # 16-byte units per sub-chunk pack per parity
+
+
+class _TwoShotIslandOverlapAllReduceLaunch(_TwoShotIslandAllReduceLaunch):
+    """Software-pipelined variant of the island all-reduce (FP32 partials).
+
+    The owned quarter is split into ``S`` sub-chunks of ``c`` packs. Iteration
+    ``t`` (one per-CTA barrier at its end) runs, for the same CTA-local pack
+    offsets: A(t) island reduce-scatter push of sub-chunk ``t``; B(t-1) FP32
+    island partial of sub-chunk ``t-1`` (order local 0..3, parked in the own
+    output as in the serial variant) and its push to the partner; C(t-2)
+    final = own + partner (commutative two-term FP32 sum, one BF16 rounding)
+    into the owned output quarter and its island all-gather push; D(t-3) copy
+    of the received quarters. The island-local legs of one sub-chunk thus
+    overlap the cross-island leg of the previous one. Each staging area (RS
+    regions, partner partial, AG regions) is written in one iteration and read
+    in the next, so two parities (sub-chunk & 1) of ``10 * c`` packs suffice.
+    Results are bitwise identical to the serial ``island`` transport.
+    """
+
+    @cute.kernel
+    def kernel(
+        self,
+        payload: cute.Pointer,
+        staging0: cute.Pointer,
+        staging1: cute.Pointer,
+        staging2: cute.Pointer,
+        staging3: cute.Pointer,
+        staging4: cute.Pointer,
+        staging5: cute.Pointer,
+        staging6: cute.Pointer,
+        staging7: cute.Pointer,
+        staging8: cute.Pointer,
+        staging9: cute.Pointer,
+        staging10: cute.Pointer,
+        staging11: cute.Pointer,
+        staging12: cute.Pointer,
+        staging13: cute.Pointer,
+        staging14: cute.Pointer,
+        staging15: cute.Pointer,
+        signal0: cute.Pointer,
+        signal1: cute.Pointer,
+        signal2: cute.Pointer,
+        signal3: cute.Pointer,
+        signal4: cute.Pointer,
+        signal5: cute.Pointer,
+        signal6: cute.Pointer,
+        signal7: cute.Pointer,
+        signal8: cute.Pointer,
+        signal9: cute.Pointer,
+        signal10: cute.Pointer,
+        signal11: cute.Pointer,
+        signal12: cute.Pointer,
+        signal13: cute.Pointer,
+        signal14: cute.Pointer,
+        signal15: cute.Pointer,
+        output: cute.Pointer,
+        rank: Int32,
+        pack_stride: Int64,
+        slot_bytes: Int64,
+        shard_packs: Int64,
+        total_packs: Int64,
+    ) -> None:
+        staging = (
+            staging0, staging1, staging2, staging3, staging4, staging5, staging6, staging7,
+            staging8, staging9, staging10, staging11, staging12, staging13, staging14, staging15,
+        )
+        signals = (
+            signal0, signal1, signal2, signal3, signal4, signal5, signal6, signal7,
+            signal8, signal9, signal10, signal11, signal12, signal13, signal14, signal15,
+        )
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        gdim, _, _ = cute.arch.grid_dim()
+        stages = _ISLAND_OVERLAP_STAGES
+        island_base = self._rank & 4
+        local = self._rank & 3
+        partner = self._rank ^ 4
+        next_local = (local + 1) & 3
+        # Sub-chunk of the quarter and this CTA's slice of every sub-chunk.
+        sub = (shard_packs + Int64(stages - 1)) // Int64(stages)
+        chunk = (sub + Int64(gdim) - Int64(1)) // Int64(gdim)
+        cta_begin = Int64(bidx) * chunk
+        cta_end = cta_begin + chunk
+        if cta_end > sub:
+            cta_end = sub
+        unit = Int64(16)
+        area = Int64(_ISLAND_OVERLAP_AREA_UNITS) * sub * unit
+
+        payload_address = Int64(payload.toint())
+        output_address = Int64(output.toint())
+        staging_slot_offset = Int64(0)
+        if cutlass.const_expr(self._device_slot_selection):
+            self_signal = Int64(signals[self._rank].toint())
+            generation = ld_relaxed_gpu_u32(self_signal + Int64(_GRAPH_EPOCH_OFFSET))
+            staging_slot_offset = (
+                Int64((generation + Uint32(self._slot_bias)) % Uint32(2)) * slot_bytes
+            )
+            cute.arch.barrier()
+            if Int32(tidx) == Int32(self._threads - 1):
+                graph_epoch_arrive_serialized(
+                    self_signal + Int64(_GRAPH_EPOCH_OFFSET),
+                    self_signal + Int64(_GRAPH_BLOCKS_ARRIVED_OFFSET),
+                    Uint32(gdim),
+                )
+        self_base = Int64(staging[self._rank].toint()) + staging_slot_offset
+        partner_base = Int64(staging[partner].toint()) + staging_slot_offset
+        own_low = output_address + Int64(local) * shard_packs * unit
+        own_high = output_address + Int64(next_local) * shard_packs * unit
+
+        for step in cutlass.range_constexpr(stages + 3):
+            # A(step): island reduce-scatter push of sub-chunk `step`.
+            if cutlass.const_expr(step < stages):
+                parity = step & 1
+                first = Int64(step) * sub
+                stop = cta_end
+                if first + stop > shard_packs:
+                    stop = shard_packs - first
+                for hop in cutlass.range_constexpr(1, 4):
+                    peer_local = (local + hop) & 3
+                    destination = (
+                        Int64(staging[island_base + peer_local].toint())
+                        + staging_slot_offset
+                        + Int64(parity) * area
+                        + Int64(local) * sub * unit
+                    )
+                    source = payload_address + (
+                        Int64(peer_local) * shard_packs + first
+                    ) * unit
+                    index = cta_begin + Int64(tidx)
+                    while index < stop:
+                        words = ld_global_nc_v4_u32(source + index * unit)
+                        _st_generic_v4_u32(
+                            destination + index * unit,
+                            words[0], words[1], words[2], words[3],
+                        )
+                        index += Int64(self._threads)
+            # B(step-1): FP32 island partial, park in own output, push to partner.
+            if cutlass.const_expr(step >= 1 and step - 1 < stages):
+                chunk_id = step - 1
+                parity = chunk_id & 1
+                first = Int64(chunk_id) * sub
+                stop = cta_end
+                if first + stop > shard_packs:
+                    stop = shard_packs - first
+                region = self_base + Int64(parity) * area
+                remote = partner_base + Int64(parity) * area + Int64(4) * sub * unit
+                index = cta_begin + Int64(tidx)
+                while index < stop:
+                    accumulator = cute.make_rmem_tensor((_PACK_ELEMS,), cutlass.Float32)
+                    for source_local in cutlass.range_constexpr(4):
+                        if cutlass.const_expr(source_local == local):
+                            words = ld_global_nc_v4_u32(
+                                payload_address
+                                + (Int64(local) * shard_packs + first + index) * unit
+                            )
+                        else:
+                            words = _ld_generic_v4_u32(
+                                region + (Int64(source_local) * sub + index) * unit
+                            )
+                        self._accumulate_words(accumulator, words, source_local == 0)
+                    low0 = f32_as_u32(accumulator[0])
+                    low1 = f32_as_u32(accumulator[1])
+                    low2 = f32_as_u32(accumulator[2])
+                    low3 = f32_as_u32(accumulator[3])
+                    high0 = f32_as_u32(accumulator[4])
+                    high1 = f32_as_u32(accumulator[5])
+                    high2 = f32_as_u32(accumulator[6])
+                    high3 = f32_as_u32(accumulator[7])
+                    st_global_v4_u32(own_low + (first + index) * unit, low0, low1, low2, low3)
+                    st_global_v4_u32(own_high + (first + index) * unit, high0, high1, high2, high3)
+                    _st_generic_v4_u32(remote + index * unit, low0, low1, low2, low3)
+                    _st_generic_v4_u32(
+                        remote + (sub + index) * unit, high0, high1, high2, high3
+                    )
+                    index += Int64(self._threads)
+            # C(step-2): final sum, one rounding, island all-gather push.
+            if cutlass.const_expr(step >= 2 and step - 2 < stages):
+                chunk_id = step - 2
+                parity = chunk_id & 1
+                first = Int64(chunk_id) * sub
+                stop = cta_end
+                if first + stop > shard_packs:
+                    stop = shard_packs - first
+                received = self_base + Int64(parity) * area + Int64(4) * sub * unit
+                index = cta_begin + Int64(tidx)
+                while index < stop:
+                    total = cute.make_rmem_tensor((_PACK_ELEMS,), cutlass.Float32)
+                    mine_low = ld_global_v4_u32(own_low + (first + index) * unit)
+                    mine_high = ld_global_v4_u32(own_high + (first + index) * unit)
+                    theirs_low = _ld_generic_v4_u32(received + index * unit)
+                    theirs_high = _ld_generic_v4_u32(received + (sub + index) * unit)
+                    for lane in cutlass.range_constexpr(4):
+                        total[lane] = u32_as_f32(mine_low[lane]) + u32_as_f32(
+                            theirs_low[lane]
+                        )
+                        total[lane + 4] = u32_as_f32(mine_high[lane]) + u32_as_f32(
+                            theirs_high[lane]
+                        )
+                    word0 = pack_f32x2_to_bf16x2(total[0], total[1])
+                    word1 = pack_f32x2_to_bf16x2(total[2], total[3])
+                    word2 = pack_f32x2_to_bf16x2(total[4], total[5])
+                    word3 = pack_f32x2_to_bf16x2(total[6], total[7])
+                    st_global_v4_u32(own_low + (first + index) * unit, word0, word1, word2, word3)
+                    for hop in cutlass.range_constexpr(1, 4):
+                        peer_local = (local + hop) & 3
+                        destination = (
+                            Int64(staging[island_base + peer_local].toint())
+                            + staging_slot_offset
+                            + Int64(parity) * area
+                            + (Int64(6 + local) * sub + index) * unit
+                        )
+                        _st_generic_v4_u32(destination, word0, word1, word2, word3)
+                    index += Int64(self._threads)
+            # D(step-3): copy the received quarters of sub-chunk step-3.
+            if cutlass.const_expr(step >= 3):
+                chunk_id = step - 3
+                parity = chunk_id & 1
+                first = Int64(chunk_id) * sub
+                stop = cta_end
+                if first + stop > shard_packs:
+                    stop = shard_packs - first
+                for hop in cutlass.range_constexpr(1, 4):
+                    source_local = (local + hop) & 3
+                    source = (
+                        self_base
+                        + Int64(parity) * area
+                        + Int64(6 + source_local) * sub * unit
+                    )
+                    destination = output_address + (
+                        Int64(source_local) * shard_packs + first
+                    ) * unit
+                    index = cta_begin + Int64(tidx)
+                    while index < stop:
+                        words = _ld_generic_v4_u32(source + index * unit)
+                        st_global_v4_u32(
+                            destination + index * unit,
+                            words[0], words[1], words[2], words[3],
+                        )
+                        index += Int64(self._threads)
+            if cutlass.const_expr(step < stages + 2):
+                self._barrier(signals, rank)
+
+
+def island_overlap_fits(shard_packs: int, pack_stride: int) -> bool:
+    """Two parities of 10 * ceil(quarter / stages) packs within the slot."""
+    sub = -(-int(shard_packs) // _ISLAND_OVERLAP_STAGES)
+    return 2 * _ISLAND_OVERLAP_AREA_UNITS * sub <= 8 * int(pack_stride)
+
+
+# Owner-eighth pipeline: staging units (16-byte packs) per sub-chunk of c packs, h = c / 2.
+_EIGHTH_RS = 0  # 2 parities x 4 regions x c   (island reduce-scatter in)
+_EIGHTH_PIN = 8  # 2 parities x c               (partner FP32 partial of my eighth)
+_EIGHTH_OWN = 10  # 2 parities x c              (own FP32 partial of my eighth, local)
+_EIGHTH_FIN = 12  # 2 parities x h              (partner's final BF16 eighth)
+_EIGHTH_AG = 13  # 3 slots x 4 regions x c     (island all-gather in)
+_EIGHTH_AREA_UNITS = 25  # x c
+
+
+def island_eighth_sub_packs(shard_packs: int) -> int:
+    """Pipeline sub-chunk (packs of the owned quarter), rounded up to even."""
+    sub = -(-int(shard_packs) // _ISLAND_OVERLAP_STAGES)
+    return sub + (sub & 1)
+
+
+def island_eighth_fits(shard_packs: int, pack_stride: int) -> bool:
+    return _EIGHTH_AREA_UNITS * island_eighth_sub_packs(shard_packs) <= 8 * int(pack_stride)
+
+
+class _TwoShotIslandEighthAllReduceLaunch(_TwoShotIslandAllReduceLaunch):
+    """Owner-eighth, software-pipelined island all-reduce (FP32 partials, W8).
+
+    Like ``island_overlap`` the owned quarter is cut into ``S`` sub-chunks of
+    ``c`` (even) packs, but each sub-chunk's quarter is split between the two
+    partners: island A (ranks 0-3) owns the first half ``[0, h)`` and island
+    B the second half ``[h, c)``. Each partner therefore sends only the FP32
+    partial of the half the other owns, the owner finalises it (own + partner,
+    commutative two-term FP32 sum, one BF16 rounding) and returns the BF16
+    half. Uplink bytes per direction drop from 2S to 1.5S; per-GPU egress is
+    1.875S (bandwidth optimum 1.75S). Iteration ``t`` (one per-CTA barrier):
+
+    A(t)   island reduce-scatter push of sub-chunk t;
+    B(t-1) FP32 island partial (order 0..3); own half -> local OWN area,
+           partner half -> partner's PIN area (cross-island);
+    C(t-2) final of the own half -> output, partner's FIN area (cross) and
+           the 3 island peers' AG area;
+    D(t-3) partner's final half (FIN) -> output and the 3 island peers;
+    E(t-4) copy the island peers' quarters (both halves) from AG.
+
+    CTAs walk the half index ``j`` and always handle packs ``j`` and ``j+h``
+    together, so every staging/output location of a pack is touched by the
+    same CTA index on every rank (the per-CTA barrier contract). Area
+    lifetimes: RS/PIN/OWN/FIN are written in one iteration and read in the
+    next (2 parities); AG is written in two consecutive iterations and read
+    in the third (3 slots). Every final element is rounded once by exactly one
+    owner and copied bitwise elsewhere, so all ranks are identical and the
+    results equal ``island`` / ``island_overlap``.
+    """
+
+    @cute.kernel
+    def kernel(
+        self,
+        payload: cute.Pointer,
+        staging0: cute.Pointer,
+        staging1: cute.Pointer,
+        staging2: cute.Pointer,
+        staging3: cute.Pointer,
+        staging4: cute.Pointer,
+        staging5: cute.Pointer,
+        staging6: cute.Pointer,
+        staging7: cute.Pointer,
+        staging8: cute.Pointer,
+        staging9: cute.Pointer,
+        staging10: cute.Pointer,
+        staging11: cute.Pointer,
+        staging12: cute.Pointer,
+        staging13: cute.Pointer,
+        staging14: cute.Pointer,
+        staging15: cute.Pointer,
+        signal0: cute.Pointer,
+        signal1: cute.Pointer,
+        signal2: cute.Pointer,
+        signal3: cute.Pointer,
+        signal4: cute.Pointer,
+        signal5: cute.Pointer,
+        signal6: cute.Pointer,
+        signal7: cute.Pointer,
+        signal8: cute.Pointer,
+        signal9: cute.Pointer,
+        signal10: cute.Pointer,
+        signal11: cute.Pointer,
+        signal12: cute.Pointer,
+        signal13: cute.Pointer,
+        signal14: cute.Pointer,
+        signal15: cute.Pointer,
+        output: cute.Pointer,
+        rank: Int32,
+        pack_stride: Int64,
+        slot_bytes: Int64,
+        shard_packs: Int64,
+        total_packs: Int64,
+    ) -> None:
+        staging = (
+            staging0, staging1, staging2, staging3, staging4, staging5, staging6, staging7,
+            staging8, staging9, staging10, staging11, staging12, staging13, staging14, staging15,
+        )
+        signals = (
+            signal0, signal1, signal2, signal3, signal4, signal5, signal6, signal7,
+            signal8, signal9, signal10, signal11, signal12, signal13, signal14, signal15,
+        )
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        gdim, _, _ = cute.arch.grid_dim()
+        stages = _ISLAND_OVERLAP_STAGES
+        island_base = self._rank & 4
+        local = self._rank & 3
+        partner = self._rank ^ 4
+        island_a = self._rank < 4
+        unit = Int64(16)
+        # Sub-chunk c (even) and half h, both in packs of the owned quarter.
+        sub = (shard_packs + Int64(stages - 1)) // Int64(stages)
+        sub = sub + (sub & Int64(1))
+        half = sub // Int64(2)
+        chunk = (half + Int64(gdim) - Int64(1)) // Int64(gdim)
+        cta_begin = Int64(bidx) * chunk
+        cta_end = cta_begin + chunk
+        if cta_end > half:
+            cta_end = half
+        sub_bytes = sub * unit
+
+        payload_address = Int64(payload.toint())
+        output_address = Int64(output.toint())
+        staging_slot_offset = Int64(0)
+        if cutlass.const_expr(self._device_slot_selection):
+            self_signal = Int64(signals[self._rank].toint())
+            generation = ld_relaxed_gpu_u32(self_signal + Int64(_GRAPH_EPOCH_OFFSET))
+            staging_slot_offset = (
+                Int64((generation + Uint32(self._slot_bias)) % Uint32(2)) * slot_bytes
+            )
+            cute.arch.barrier()
+            if Int32(tidx) == Int32(self._threads - 1):
+                graph_epoch_arrive_serialized(
+                    self_signal + Int64(_GRAPH_EPOCH_OFFSET),
+                    self_signal + Int64(_GRAPH_BLOCKS_ARRIVED_OFFSET),
+                    Uint32(gdim),
+                )
+        self_base = Int64(staging[self._rank].toint()) + staging_slot_offset
+        partner_base = Int64(staging[partner].toint()) + staging_slot_offset
+        own_quarter = output_address + Int64(local) * shard_packs * unit
+        # Half offsets of this rank's own and its partner's half of a sub-chunk.
+        mine = Int64(0) if island_a else half
+        theirs = half if island_a else Int64(0)
+
+        for step in cutlass.range_constexpr(stages + 4):
+            # A(step): island reduce-scatter push of sub-chunk `step` (both halves).
+            if cutlass.const_expr(step < stages):
+                parity = step & 1
+                first = Int64(step) * sub
+                for hop in cutlass.range_constexpr(1, 4):
+                    peer_local = (local + hop) & 3
+                    destination = (
+                        Int64(staging[island_base + peer_local].toint())
+                        + staging_slot_offset
+                        + Int64(_EIGHTH_RS + parity * 4 + local) * sub_bytes
+                    )
+                    source = payload_address + (Int64(peer_local) * shard_packs + first) * unit
+                    j = cta_begin + Int64(tidx)
+                    while j < cta_end:
+                        for side in cutlass.range_constexpr(2):
+                            position = j + (half if side == 1 else Int64(0))
+                            if first + position < shard_packs:
+                                words = ld_global_nc_v4_u32(source + position * unit)
+                                _st_generic_v4_u32(
+                                    destination + position * unit,
+                                    words[0], words[1], words[2], words[3],
+                                )
+                        j += Int64(self._threads)
+            # B(step-1): FP32 island partial; own half -> OWN, partner half -> partner PIN.
+            if cutlass.const_expr(step >= 1 and step - 1 < stages):
+                chunk_id = step - 1
+                parity = chunk_id & 1
+                first = Int64(chunk_id) * sub
+                regions = self_base + Int64(_EIGHTH_RS + parity * 4) * sub_bytes
+                own_area = self_base + Int64(_EIGHTH_OWN + parity) * sub_bytes
+                remote_area = partner_base + Int64(_EIGHTH_PIN + parity) * sub_bytes
+                j = cta_begin + Int64(tidx)
+                while j < cta_end:
+                    for side in cutlass.range_constexpr(2):
+                        offset = mine if side == 0 else theirs
+                        position = j + offset
+                        if first + position < shard_packs:
+                            accumulator = cute.make_rmem_tensor((_PACK_ELEMS,), cutlass.Float32)
+                            for source_local in cutlass.range_constexpr(4):
+                                if cutlass.const_expr(source_local == local):
+                                    words = ld_global_nc_v4_u32(
+                                        payload_address
+                                        + (Int64(local) * shard_packs + first + position) * unit
+                                    )
+                                else:
+                                    words = _ld_generic_v4_u32(
+                                        regions + Int64(source_local) * sub_bytes + position * unit
+                                    )
+                                self._accumulate_words(accumulator, words, source_local == 0)
+                            target = own_area if side == 0 else remote_area
+                            _st_generic_v4_u32(
+                                target + j * unit,
+                                f32_as_u32(accumulator[0]),
+                                f32_as_u32(accumulator[1]),
+                                f32_as_u32(accumulator[2]),
+                                f32_as_u32(accumulator[3]),
+                            )
+                            _st_generic_v4_u32(
+                                target + (half + j) * unit,
+                                f32_as_u32(accumulator[4]),
+                                f32_as_u32(accumulator[5]),
+                                f32_as_u32(accumulator[6]),
+                                f32_as_u32(accumulator[7]),
+                            )
+                    j += Int64(self._threads)
+            # C(step-2): final of the own half; output, partner FIN, island AG.
+            if cutlass.const_expr(step >= 2 and step - 2 < stages):
+                chunk_id = step - 2
+                parity = chunk_id & 1
+                first = Int64(chunk_id) * sub
+                own_area = self_base + Int64(_EIGHTH_OWN + parity) * sub_bytes
+                received = self_base + Int64(_EIGHTH_PIN + parity) * sub_bytes
+                remote_final = partner_base + Int64(_EIGHTH_FIN) * sub_bytes + Int64(parity) * half * unit
+                j = cta_begin + Int64(tidx)
+                while j < cta_end:
+                    position = j + mine
+                    if first + position < shard_packs:
+                        total = cute.make_rmem_tensor((_PACK_ELEMS,), cutlass.Float32)
+                        own_low = ld_global_v4_u32(own_area + j * unit)
+                        own_high = ld_global_v4_u32(own_area + (half + j) * unit)
+                        peer_low = _ld_generic_v4_u32(received + j * unit)
+                        peer_high = _ld_generic_v4_u32(received + (half + j) * unit)
+                        for lane in cutlass.range_constexpr(4):
+                            total[lane] = u32_as_f32(own_low[lane]) + u32_as_f32(peer_low[lane])
+                            total[lane + 4] = u32_as_f32(own_high[lane]) + u32_as_f32(
+                                peer_high[lane]
+                            )
+                        word0 = pack_f32x2_to_bf16x2(total[0], total[1])
+                        word1 = pack_f32x2_to_bf16x2(total[2], total[3])
+                        word2 = pack_f32x2_to_bf16x2(total[4], total[5])
+                        word3 = pack_f32x2_to_bf16x2(total[6], total[7])
+                        st_global_v4_u32(
+                            own_quarter + (first + position) * unit, word0, word1, word2, word3
+                        )
+                        _st_generic_v4_u32(remote_final + j * unit, word0, word1, word2, word3)
+                        for hop in cutlass.range_constexpr(1, 4):
+                            peer_local = (local + hop) & 3
+                            destination = (
+                                Int64(staging[island_base + peer_local].toint())
+                                + staging_slot_offset
+                                + Int64(_EIGHTH_AG + (chunk_id % 3) * 4 + local) * sub_bytes
+                                + position * unit
+                            )
+                            _st_generic_v4_u32(destination, word0, word1, word2, word3)
+                    j += Int64(self._threads)
+            # D(step-3): partner's final half -> output and island AG.
+            if cutlass.const_expr(step >= 3 and step - 3 < stages):
+                chunk_id = step - 3
+                parity = chunk_id & 1
+                first = Int64(chunk_id) * sub
+                final_in = self_base + Int64(_EIGHTH_FIN) * sub_bytes + Int64(parity) * half * unit
+                j = cta_begin + Int64(tidx)
+                while j < cta_end:
+                    position = j + theirs
+                    if first + position < shard_packs:
+                        words = _ld_generic_v4_u32(final_in + j * unit)
+                        st_global_v4_u32(
+                            own_quarter + (first + position) * unit,
+                            words[0], words[1], words[2], words[3],
+                        )
+                        for hop in cutlass.range_constexpr(1, 4):
+                            peer_local = (local + hop) & 3
+                            destination = (
+                                Int64(staging[island_base + peer_local].toint())
+                                + staging_slot_offset
+                                + Int64(_EIGHTH_AG + (chunk_id % 3) * 4 + local) * sub_bytes
+                                + position * unit
+                            )
+                            _st_generic_v4_u32(
+                                destination, words[0], words[1], words[2], words[3]
+                            )
+                    j += Int64(self._threads)
+            # E(step-4): copy the island peers' quarters of sub-chunk step-4.
+            if cutlass.const_expr(step >= 4):
+                chunk_id = step - 4
+                first = Int64(chunk_id) * sub
+                for hop in cutlass.range_constexpr(1, 4):
+                    source_local = (local + hop) & 3
+                    source = self_base + Int64(_EIGHTH_AG + (chunk_id % 3) * 4 + source_local) * sub_bytes
+                    destination = output_address + (Int64(source_local) * shard_packs + first) * unit
+                    j = cta_begin + Int64(tidx)
+                    while j < cta_end:
+                        for side in cutlass.range_constexpr(2):
+                            position = j + (half if side == 1 else Int64(0))
+                            if first + position < shard_packs:
+                                words = _ld_generic_v4_u32(source + position * unit)
+                                st_global_v4_u32(
+                                    destination + position * unit,
+                                    words[0], words[1], words[2], words[3],
+                                )
+                        j += Int64(self._threads)
+            if cutlass.const_expr(step < stages + 3):
+                self._barrier(signals, rank)
+
+
+@program_cache
+def get_twoshot_bf16_island_launcher(
+    world_size: int,
+    rank: int,
+    device_slot_selection: bool,
+    slot_bias: int,
+    threads: int,
+    row_elems: int,
+    device_index: int,
+    wire_bf16: bool = False,
+    overlap: bool = False,
+    eighth: bool = False,
+) -> Callable[..., None]:
+    """Compile the single-launch 2-island hierarchical all-reduce (world 8)."""
+    if (overlap or eighth) and wire_bf16:
+        raise ValueError("the overlapped island all-reduce carries FP32 partials only")
+    if overlap and eighth:
+        raise ValueError("choose one island pipeline variant")
+    del device_index  # part of the process-local cache key
+    if int(world_size) != 8:
+        raise ValueError("island two-shot all-reduce requires world size 8")
+    if rank < 0 or rank >= world_size:
+        raise ValueError(f"rank {rank} is outside world size {world_size}")
+    if threads <= 0 or threads > 512 or threads % 32 != 0:
+        raise ValueError("threads must be a warp-aligned value in [32, 512]")
+    if row_elems <= 0 or row_elems % _PACK_ELEMS != 0:
+        raise ValueError("row_elems must be a positive multiple of 8")
+    slot_bias = int(slot_bias) & 1
+    launch = (
+        _TwoShotIslandEighthAllReduceLaunch
+        if eighth
+        else _TwoShotIslandOverlapAllReduceLaunch
+        if overlap
+        else _TwoShotIslandAllReduceLaunch
+    )(
+        world_size,
+        rank,
+        device_slot_selection,
+        slot_bias,
+        threads,
+        row_elems,
+        wire_bf16,
+    )
+    name = (
+        "all_reduce_island_eighth"
+        if eighth
+        else "all_reduce_island_overlap"
+        if overlap
+        else ("all_reduce_island_bf16" if wire_bf16 else "all_reduce_island")
+    )
+    cache_key = (
+        "bf16",
+        name,
+        int(world_size),
+        int(rank),
+        bool(device_slot_selection),
+        slot_bias,
+        int(threads),
+        int(row_elems),
+    )
+    raise_if_kernel_resolution_frozen(
+        "cute.compile", target=launch, cache_key=cache_key
+    )
+    raw = b12x_compile(
+        launch,
+        make_ptr(cutlass.Uint32, 16, cute.AddressSpace.gmem, assumed_align=16),
+        *(
+            make_ptr(cutlass.Uint32, 16, cute.AddressSpace.gmem, assumed_align=16)
+            for _ in range(16)
+        ),
+        *(
+            make_ptr(cutlass.Uint32, 16, cute.AddressSpace.gmem, assumed_align=4)
+            for _ in range(16)
+        ),
+        make_ptr(cutlass.Uint32, 16, cute.AddressSpace.gmem, assumed_align=16),
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        current_cuda_stream(),
+        compile_spec=KernelCompileSpec.from_key(
+            f"comm.pcie.twoshot_bf16.{name}",
+            1,
+            cache_key,
+        ),
+    )
+
+    def run(
+        payload_address: int,
+        staging_addresses: Sequence[int],
+        signal_addresses: Sequence[int],
+        output_address: int,
+        rank: int,
+        pack_stride: int,
+        slot_bytes: int,
+        shard_packs: int,
+        total_packs: int,
+        grid_x: int,
+    ) -> None:
+        if len(staging_addresses) != 16 or len(signal_addresses) != 16:
+            raise ValueError("two-shot scalar pointer ABI requires sixteen peers")
+        raw(
+            make_ptr(cutlass.Uint32, payload_address, cute.AddressSpace.gmem, assumed_align=16),
+            *(
+                make_ptr(cutlass.Uint32, address, cute.AddressSpace.gmem, assumed_align=16)
+                for address in staging_addresses
+            ),
+            *(
+                make_ptr(cutlass.Uint32, address, cute.AddressSpace.gmem, assumed_align=4)
+                for address in signal_addresses
+            ),
+            make_ptr(cutlass.Uint32, output_address, cute.AddressSpace.gmem, assumed_align=16),
+            rank,
+            pack_stride,
+            slot_bytes,
+            shard_packs,
+            total_packs,
+            grid_x,
+            current_cuda_stream(),
+        )
+
+    return attach_programs(run, raw)

@@ -237,6 +237,9 @@ def trellis_prefill_launch_shape(m: int) -> dict | None:
     for prefill token counts (M >= 128), so decode graph catalogs are
     bit-identical to the current package by construction.
     """
+    table_shape = trellis_prefill_table_shape(m)
+    if table_shape is not None:
+        return table_shape
     if os.getenv("B12X_W4A16_PREFILL_SHAPES", "0") != "1":
         return None
     m = int(m)
@@ -252,6 +255,32 @@ def trellis_prefill_launch_shape(m: int) -> dict | None:
     if m >= 1024:
         return {"block_size_m": 32, "pipeline_stages": 2, "trellis_decode_table": "full"}
     return {"block_size_m": 16, "pipeline_stages": 3, "trellis_decode_table": "full"}
+
+
+# Direct-table prefill geometry (B12X_W4A16_PREFILL_TABLE=1, default off;
+# local-inference-lab/flashinfer 07c276e25). Consulted for launches of 1,536 to
+# 2,560 tokens only, so decode, verification and draft plans never see it; it
+# takes precedence over the prefill-shapes policy where it applies. "full1" is
+# the 64 KiB direct decode table at one resident CTA per SM with the GEMM
+# output and reduction tile laid over the dead B/S/A stages (fused.py,
+# gemm.py reduction_over_stages), which is what lets 48-row stages fit beside
+# the table. Measured by its author on a Kimi K3.1 TP8 shard against the
+# prefill shapes, us per layer: 2,048 rows 3,045 against 3,752, 1,536 rows
+# 2,742 against 2,880, 2,560 rows 3,872 against 4,183. The tile changes the
+# FP32 summation order over K (same arithmetic precision).
+def trellis_prefill_table_shape(m: int) -> dict | None:
+    """Direct-table prefill launch shape (block, stages, table, tile), or None."""
+    if os.getenv("B12X_W4A16_PREFILL_TABLE", "0") != "1":
+        return None
+    m = int(m)
+    if 1536 <= m <= 2560:
+        return {
+            "block_size_m": 48,
+            "pipeline_stages": 2,
+            "trellis_decode_table": "full1",
+            "tile_config": (128, 128, 64, 256),
+        }
+    return None
 
 
 def route_block_sizes_for_capacity(

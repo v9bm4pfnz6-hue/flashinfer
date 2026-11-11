@@ -16,6 +16,7 @@ from b12x._lib.intrinsics.atomics import atomic_add_global_i32
 from b12x._lib.quant.block_codec import block_codec
 from b12x._lib.intrinsics.memory import cp_async4_shared_global
 import cuda.bindings.driver as cuda
+import os
 import cutlass.cute as cute
 import cutlass
 from b12x._lib.intrinsics.math import fabs_f32
@@ -33,6 +34,11 @@ from b12x._lib.intrinsics.memory import shared_ptr_to_u32
 from b12x._lib.intrinsics.atomics import st_global_i32
 from b12x._lib.intrinsics.memory import st_global_v4_u32
 from b12x._lib.intrinsics.atomics import st_shared_f32
+from b12x._lib.intrinsics.atomics import ld_shared_i32
+from b12x._lib.intrinsics.atomics import st_shared_i32
+from b12x.moe._shared.kernels.w4a16.kernel.types import W4A16_FLOW_LIVE_BLOCKS
+from b12x.moe._shared.kernels.w4a16.kernel.types import W4A16_FLOW_MAX_BLOCKS
+from b12x._lib.intrinsics.atomics import atomic_add_shared_i32
 from b12x._lib.intrinsics.memory import st_shared_v4_u32
 from b12x._lib.intrinsics.sync import threadfence
 from b12x._lib.intrinsics.memory import u32_as_f32
@@ -56,6 +62,7 @@ from b12x.moe._shared.kernels.w4a16.kernel.config import (
     _normalize_scale_format,
     _pack_f32x2_to_bf16x2_rn,
     _resident_cta_shared_bytes,
+    _trellis_launch_switch,
     _w4a16_small_m_splitk_enabled,
 )
 from b12x.moe._shared.kernels.w4a16.kernel.gemm import W4A16GemmKernel
@@ -162,6 +169,8 @@ class W4A16FusedMoeKernel:
             )
         fc1_cols = int(intermediate_size) * (2 if is_gated else 1)
         routed_rows = int(size_m) * int(top_k)
+        # Prefill-only direct-table geometry (see "full1" below).
+        prefill_direct_table = trellis_decode_table == "full1"
         self.size_m = int(size_m)
         self.hidden_size = int(hidden_size)
         self.intermediate_size = int(intermediate_size)
@@ -381,6 +390,7 @@ class W4A16FusedMoeKernel:
             small_m_occupancy=small_m_occupancy,
             small_m_splitk=small_m_splitk,
             csf_inline_scales=csf_inline_scales,
+            reduction_over_stages=prefill_direct_table,
         )
         if (
             _FP32_TOPK_WEIGHTS
@@ -434,6 +444,7 @@ class W4A16FusedMoeKernel:
             small_m_occupancy=small_m_occupancy,
             small_m_splitk=small_m_splitk,
             csf_inline_scales=csf_inline_scales,
+            reduction_over_stages=prefill_direct_table,
         )
         self.cta_threads = max(self.fc1.cta_threads, self.fc2.cta_threads)
         if self.fc1.cta_threads != self.fc2.cta_threads:
@@ -453,8 +464,22 @@ class W4A16FusedMoeKernel:
             self.shared_words += self.iq2_lut_bytes // 4
             self.fc1.iq2_xs_smem_lut = True
             self.fc2.iq2_xs_smem_lut = True
-        if trellis_decode_table not in {"auto", "compact", "full"}:
-            raise ValueError("trellis decode table must be auto, compact, or full")
+        if trellis_decode_table not in {"auto", "compact", "full", "full1"}:
+            raise ValueError(
+                "trellis decode table must be auto, compact, full, or full1"
+            )
+        if trellis_decode_table == "full1":
+            # Opt-in prefill geometry (B12X_W4A16_PREFILL_TABLE, M > 16 plans
+            # only): the direct table at ONE resident CTA per SM. The 64 KiB
+            # table already leaves no room for a second CTA, so the GEMMs'
+            # two-CTA occupancy estimate is clamped instead of rejecting the
+            # table. Launch bounds and the cooperative grid follow.
+            if size_m <= 16:
+                raise ValueError("full1 decode table is a prefill-only geometry")
+            self.fc1.blocks_per_sm = 1
+            self.fc2.blocks_per_sm = 1
+            self.blocks_per_sm = 1
+            trellis_decode_table = "full"
         # Non-Trellis layouts inherit the codebook argument's default, but do
         # not consume its table. Allocating it for block codecs adds 4 KiB
         # outside their occupancy estimate and can reject cooperative launch.
@@ -487,9 +512,54 @@ class W4A16FusedMoeKernel:
         self.fc1.trellis_direct_lut = self.trellis_direct_lut
         self.fc2.trellis_direct_lut = self.trellis_direct_lut
         self.lut_e4m3_smem = compact_smem or self.trellis_direct_lut
+        lut_cp_async_mode = _trellis_launch_switch("B12X_TRELLIS_LUT_CP_ASYNC", size_m)
+        self.lut_cp_async = self.lut_e4m3_smem and lut_cp_async_mode in ("1", "2")
+        # Mode 2 leaves the table copy in flight through the register-only
+        # input rotation and waits immediately before FC1 consumes it.
+        self.lut_cp_async_deferred = self.lut_cp_async and lut_cp_async_mode == "2"
+        self.extra_grid_barriers = int(
+            os.environ.get("B12X_TRELLIS_EXTRA_BARRIERS", "0")
+        )
+        # Opt-in: issue every rotation side-table / FC1 load of the input
+        # rotation and of the SiTU + intermediate-Hadamard phase up front so
+        # each warp pays one global round trip instead of one per dependent
+        # step.  Same arithmetic in the same order -> bit-identical output.
+        # Uniform-rate layout only (pair layouts keep the original path).
+        self.prefetch_sides = (
+            _trellis_launch_switch("B12X_TRELLIS_PREFETCH_SIDES", size_m) == "1"
+            and self.fc1_trellis_pair_kind is None
+        )
         self.trellis_lut_smem_bytes = (
             65536 if self.trellis_direct_lut else _LUT_E4M3_SMEM_REGION_BYTES
         )
+        # Opt-in: build the packed route layout (packed_route_indices,
+        # block_expert_ids, packed_route_count) inside the fused kernel instead
+        # of the two Triton route-pack launches.  The last CTA's last four warps
+        # (idle during the shared input rotation) pack <= 128 routes before
+        # grid barrier 1, which publishes them to FC1.  Within an expert,
+        # routes are ordered by route index (deterministic); FC rows are
+        # independent, so the output is unchanged.  The host opts in per call
+        # (route_num_experts == -1 carries the int32 top-k ids pointer in the
+        # expert-map slot); any other call keeps the Triton packing.
+        # B12X_TRELLIS_INKERNEL_ROUTE_PACK=2: shared-memory histogram packer
+        # on all 8 warps of the last CTA, <= 256 live routes (16 rows at
+        # top-16, i.e. two K7-verify streams) and <= 1024 experts.
+        route_pack_mode = _trellis_launch_switch("B12X_TRELLIS_INKERNEL_ROUTE_PACK", size_m)
+        self.inkernel_route_pack = (
+            route_pack_mode in ("1", "2")
+            and self.full_rotation
+            and self.shared_input_rotation
+            and self.intermediate_hadamard
+            and not self.direct_topk_routes
+            and not self.use_expert_map
+            and self.fc1_trellis_pair_kind is None
+            and self.activation_is_gated
+            and self.cta_threads >= 128
+            and not self.tc_decode_fused_sum
+            and not self.prefill_fused_sum_fp32
+        )
+        self.route_pack_hist = route_pack_mode == "2" and self.cta_threads == 256
+        self.route_pack_max_routes = 256 if self.route_pack_hist else 128
         self.lut_e4m3_smem_off = 0
         if self.lut_e4m3_smem:
             self.lut_e4m3_smem_off = (self.shared_words * 4 + 15) // 16 * 16
@@ -504,6 +574,56 @@ class W4A16FusedMoeKernel:
             self.fc2.lut_e4m3_smem = True
         self.barrier_count_off = self.sms * 4
         self.barrier_sense_off = self.sms * 4 + 1
+        # Opt-in (B12X_TRELLIS_FLOW_FLAGS=1): replace grid barriers 2 and 3 by
+        # per-route-block dependency counters.  FC1's final split-K slice of a
+        # tile adds 1 to fc1_ctr[block]; an activation unit waits for
+        # fc1_ctr[block] == FC1 n-tiles, then adds 1 to act_ctr[block]; an FC2
+        # piece waits for act_ctr[block] == BS * I/128.  Counters live in a
+        # planner-allocated workspace extension (W4A16_FLOW_WORKSPACE_EXTRA)
+        # after the barrier words.  All flow state (counters and every
+        # split-K lock slot, FC2 locks moved to [2*sms, 3*sms + 8)) is zeroed
+        # cooperatively before grid barrier 1, so nothing depends on what a
+        # previous launch or another kernel sharing the scratch arena left
+        # there.  Deadlock-free on the cooperative grid: no CTA waits before
+        # finishing its own FC1 work, and activation never waits on FC2.
+        # Same arithmetic -> bit-identical output.
+        self.flow_seq_off = self.sms * 4 + 2
+        self.flow_ctr_off = self.flow_seq_off + 4
+        # Lock words zeroed at entry: FC1 slots [0, 2*sms) and the moved FC2
+        # slots [2*sms, 3*sms + 8) (lock_slot <= grid_x + 2 <= sms + 2).
+        self.flow_lock_words = 3 * self.sms + 8
+        self.flow_max_blocks = W4A16_FLOW_MAX_BLOCKS
+        self.flow_live_blocks = min(W4A16_FLOW_LIVE_BLOCKS, W4A16_FLOW_MAX_BLOCKS)
+        self.flow_flags = (
+            _trellis_launch_switch("B12X_TRELLIS_FLOW_FLAGS", size_m) == "1"
+            and self.full_rotation
+            and self.intermediate_hadamard
+            and self.activation_is_gated
+            and not self.direct_topk_routes
+            and not self.use_expert_map
+            and not self.collect_activation_amax
+            and not self.zero_fc2_output
+            and not self.tc_decode_fused_sum
+            and not self.prefill_fused_sum_fp32
+            and self.extra_grid_barriers == 0
+            and self.fc1_trellis_pair_kind is None
+            and self.fc1.schedule_route_block_factor == 1
+            and self.fc2.schedule_route_block_factor == 1
+            and not self.fc1.schedule_whole_tiles
+            and not self.fc2.schedule_whole_tiles
+            and self.intermediate_size % 128 == 0
+        )
+        if self.flow_flags:
+            for gemm_kernel, role in ((self.fc1, 1), (self.fc2, 2)):
+                gemm_kernel.flow_role = role
+                gemm_kernel.flow_seq_off = self.flow_seq_off
+                gemm_kernel.flow_ctr_off = self.flow_ctr_off
+                gemm_kernel.flow_max_blocks = self.flow_max_blocks
+                gemm_kernel.flow_live_blocks = self.flow_live_blocks
+            self.fc2.flow_lock_offset = 2 * self.sms
+            self.fc2.flow_act_target = self.moe_block_size * (
+                self.intermediate_size // 128
+            )
         # The cooperative launch must admit blocks_per_sm CTAs on every SM.
         if self.fc1.weight_layout_block:
             self.smem_carveout = 100
@@ -564,6 +684,13 @@ class W4A16FusedMoeKernel:
             self.rotation_input_dtype,
             self.lut_e4m3_smem,
             self.trellis_direct_lut,
+            self.lut_cp_async,
+            self.lut_cp_async_deferred,
+            self.extra_grid_barriers,
+            self.prefetch_sides,
+            self.inkernel_route_pack,
+            self.route_pack_hist,
+            self.flow_flags,
             self.small_m_splitk,
             self.fc1.__cache_key__,
             self.fc2.__cache_key__,
@@ -848,6 +975,15 @@ class W4A16FusedMoeKernel:
                 (Int64(route_num_experts) + Int64(1),), stride=(1,)
             ),
         )
+        if cutlass.const_expr(self.inkernel_route_pack):
+            # In-kernel route packing: the expert-map slot carries the int32
+            # top-k ids (the packed path never uses an expert map).
+            expert_map_flat = cute.make_tensor(
+                expert_map_ptr,
+                layout=cute.make_layout(
+                    (Int64(active_m) * Int64(self.top_k) + Int64(1),), stride=(1,)
+                ),
+            )
         fc1_trellis_lut_flat = cute.make_tensor(
             fc1_trellis_lut_ptr,
             layout=cute.make_layout(
@@ -985,7 +1121,23 @@ class W4A16FusedMoeKernel:
             table_addr = Int64(smem_base + Int32(self.iq2_xs_lut_off))
             fc1_phase_lut_addr = table_addr
             fc2_phase_lut_addr = table_addr
-        if cutlass.const_expr(self.lut_e4m3_smem):
+        if cutlass.const_expr(self.lut_e4m3_smem and self.lut_cp_async):
+            # Issue every 16-byte chunk of the table before waiting once, so
+            # the L2 round trips overlap instead of serializing per iteration.
+            for i in cutlass.range_constexpr(
+                _covering_count(self.trellis_lut_smem_bytes // 16, self.cta_threads)
+            ):
+                chunk = Int32(i * self.cta_threads) + tid
+                if chunk < Int32(self.trellis_lut_smem_bytes // 16):
+                    cp_async4_shared_global(
+                        smem_base + Int32(self.lut_e4m3_smem_off) + chunk * Int32(16),
+                        fc1_trellis_lut_addr + Int64(chunk) * Int64(16),
+                    )
+            cute.arch.cp_async_commit_group()
+            if cutlass.const_expr(not self.lut_cp_async_deferred):
+                cute.arch.cp_async_wait_group(0)
+                cute.arch.sync_threads()
+        elif cutlass.const_expr(self.lut_e4m3_smem):
             self._lut_smem_copy(
                 fc1_trellis_lut_addr,
                 smem_base + Int32(self.lut_e4m3_smem_off),
@@ -993,6 +1145,9 @@ class W4A16FusedMoeKernel:
                 tid,
             )
             cute.arch.sync_threads()
+        if cutlass.const_expr(self.lut_e4m3_smem):
+            # The cp.async staging branch must also hand the shared table
+            # offset to the expert-map emit hooks.
             table_addr = Int64(smem_base + Int32(self.lut_e4m3_smem_off))
             fc1_phase_lut_addr = table_addr
             fc2_phase_lut_addr = table_addr
@@ -1146,6 +1301,49 @@ class W4A16FusedMoeKernel:
             table_addr = Int64(smem_base + Int32(self.lut_e4m3_smem_off))
             fc1_phase_lut = table_addr
             fc2_phase_lut = table_addr
+        if cutlass.const_expr(self.inkernel_route_pack):
+            if route_num_experts < Int32(0):
+                if cutlass.const_expr(self.route_pack_hist):
+                  if active_m * Int32(self.top_k) <= Int32(128):
+                    # <= 128 routes: the (faster at this size) 4-warp packer.
+                    self._pack_routes_in_kernel(
+                        expert_map_flat,
+                        packed_route_indices,
+                        block_expert_ids,
+                        packed_route_count,
+                        weight_num_experts,
+                        smem_base,
+                        tid,
+                        cta,
+                        grid_x,
+                        active_m,
+                    )
+                  else:
+                    self._pack_routes_in_kernel_hist(
+                    expert_map_flat,
+                        packed_route_indices,
+                        block_expert_ids,
+                        packed_route_count,
+                        weight_num_experts,
+                        smem_base,
+                        tid,
+                        cta,
+                        grid_x,
+                        active_m,
+                    )
+                else:
+                    self._pack_routes_in_kernel(
+                    expert_map_flat,
+                        packed_route_indices,
+                        block_expert_ids,
+                        packed_route_count,
+                        weight_num_experts,
+                        smem_base,
+                        tid,
+                        cta,
+                        grid_x,
+                        active_m,
+                    )
         if cutlass.const_expr(self.full_rotation):
             if cutlass.const_expr(self.intermediate_hadamard):
                 self._run_input_rotation_intermediate_hadamard(
@@ -1181,7 +1379,34 @@ class W4A16FusedMoeKernel:
                     grid_x,
                     active_m,
                 )
+            if cutlass.const_expr(self.flow_flags):
+                # Cooperative init: zero every split-K lock slot (FC1 and the
+                # moved FC2 range) and the dependency counters before grid
+                # barrier 1. Nothing reads or writes them before that barrier,
+                # and the barrier publishes the zeros to all CTAs, so the flow
+                # state never depends on what earlier launches or other
+                # kernels sharing the scratch arena left in these words.
+                zi = cta * Int32(self.cta_threads) + tid
+                if zi < Int32(self.flow_lock_words):
+                    st_global_i32(get_ptr_as_int64(locks_i32_flat, zi), Int32(0))
+                elif zi < Int32(self.flow_lock_words + 2 * self.flow_max_blocks):
+                    st_global_i32(
+                        get_ptr_as_int64(
+                            locks_i32_flat,
+                            Int32(self.flow_ctr_off - self.flow_lock_words) + zi,
+                        ),
+                        Int32(0),
+                    )
             self._grid_barrier(locks_i32_flat, tid, grid_x)
+        flow_live = Int32(0)
+        flow_ctr = Int64(0)
+        if cutlass.const_expr(self.flow_flags):
+            route_blocks_now = packed_route_count[Int32(0)].to(Int32) // Int32(
+                self.moe_block_size
+            )
+            if route_blocks_now <= Int32(self.flow_live_blocks):
+                flow_live = Int32(1)
+            flow_ctr = get_ptr_as_int64(locks_i32_flat, Int32(self.flow_ctr_off))
         if cutlass.const_expr(
             (self.tc_decode_fused_sum and self.weight_layout not in BLOCK_CODECS)
             or self.prefill_fused_sum_fp32
@@ -1212,6 +1437,11 @@ class W4A16FusedMoeKernel:
                         fc2_bf16_flat[zidx] = zzero
                         zidx += zstride
 
+        if cutlass.const_expr(self.lut_cp_async_deferred):
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.sync_threads()
+        for _ in cutlass.range_constexpr(self.extra_grid_barriers):
+            self._grid_barrier(locks_i32_flat, tid, grid_x)
         if cutlass.const_expr(self.activation_is_gated):
             self.fc1._run_persistent_gemm(
                 a_bf16_flat,
@@ -1234,7 +1464,11 @@ class W4A16FusedMoeKernel:
                 active_m,
                 fc1_emit_tile,
             )
-            self._grid_barrier(locks_i32_flat, tid, grid_x)
+            if cutlass.const_expr(self.flow_flags):
+                if flow_live == Int32(0):
+                    self._grid_barrier(locks_i32_flat, tid, grid_x)
+            else:
+                self._grid_barrier(locks_i32_flat, tid, grid_x)
             if cutlass.const_expr(self.full_rotation):
                 if cutlass.const_expr(self.intermediate_hadamard):
                     self._run_activation_intermediate_hadamard(
@@ -1251,6 +1485,8 @@ class W4A16FusedMoeKernel:
                         cta,
                         grid_x,
                         active_m,
+                        flow_live,
+                        flow_ctr,
                     )
                 else:
                     self._run_activation_compact(
@@ -1300,7 +1536,11 @@ class W4A16FusedMoeKernel:
                 active_m,
                 fc1_emit_tile,
             )
-        self._grid_barrier(locks_i32_flat, tid, grid_x)
+        if cutlass.const_expr(self.flow_flags):
+            if flow_live == Int32(0):
+                self._grid_barrier(locks_i32_flat, tid, grid_x)
+        else:
+            self._grid_barrier(locks_i32_flat, tid, grid_x)
         if cutlass.const_expr(self.collect_activation_amax):
             self._collect_activation_amax_epilogue(
                 a_bf16_flat,
@@ -1434,6 +1674,174 @@ class W4A16FusedMoeKernel:
             v0, v1, v2, v3 = ld_global_nc_v4_u32(src_addr + Int64(i) * Int64(16))
             st_shared_v4_u32(dst_off + i * Int32(16), v0, v1, v2, v3)
             i += Int32(self.cta_threads)
+
+    @cute.jit
+    def _pack_routes_in_kernel(
+        self,
+        route_ids_flat: cute.Tensor,
+        packed_route_indices: cute.Tensor,
+        block_expert_ids: cute.Tensor,
+        packed_route_count: cute.Tensor,
+        weight_num_experts: Int32,
+        smem_base: Int32,
+        tid: Int32,
+        cta: Int32,
+        grid_x: Int32,
+        active_m: cutlass.Int32,
+    ):
+        """Pack <= 128 routes by expert (same layout as route_pack.py).
+
+        Runs on the last 4 warps of the last CTA before grid barrier 1. Route u
+        (warp w = u // 32, lane = u % 32) gets rank = #earlier routes of its
+        expert; a route with rank % BS == 0 heads a BS-row block; its slot is
+        BS * #heads of smaller experts + rank. The last route of an expert
+        fills the segment padding with the live-route sentinel. Uses the first
+        512 B of the (still unused) GEMM staging smem for the head keys."""
+        bs = self.moe_block_size
+        numel = active_m * Int32(self.top_k)
+        warp_in_cta = tid >> Int32(5)
+        lane = tid & Int32(31)
+        pw = warp_in_cta - Int32(self.cta_threads // 32 - 4)
+        if cta == grid_x - Int32(1) and pw >= Int32(0):
+            big = Int32(0x7FFFFFFF)
+            ids = cute.make_rmem_tensor((4,), Int32)
+            for c in cutlass.range_constexpr(4):
+                u = Int32(c * 32) + lane
+                x = Int32(-1)
+                if u < numel:
+                    x = route_ids_flat[u].to(Int32)
+                    if x < Int32(0) or x >= weight_num_experts:
+                        x = Int32(-1)
+                ids[c] = x
+            my = ids[0]
+            for c in cutlass.range_constexpr(1, 4):
+                if pw == Int32(c):
+                    my = ids[c]
+            u_me = pw * Int32(32) + lane
+            rank = Int32(0)
+            cnt = Int32(0)
+            for c in cutlass.range_constexpr(4):
+                for j in cutlass.range_constexpr(32):
+                    x = cute.arch.shuffle_sync(ids[c], j)
+                    if x == my:
+                        cnt += Int32(1)
+                        if Int32(c * 32 + j) < u_me:
+                            rank += Int32(1)
+            key = big
+            if my >= Int32(0) and rank % Int32(bs) == Int32(0):
+                key = my
+            st_shared_i32(smem_base + u_me * Int32(4), key)
+            cute.arch.barrier(barrier_id=1, number_of_threads=128)
+            heads_below = Int32(0)
+            heads_total = Int32(0)
+            for v in cutlass.range_constexpr(128):
+                kv = ld_shared_i32(smem_base + Int32(v * 4))
+                if kv < my:
+                    heads_below += Int32(1)
+                if kv != big:
+                    heads_total += Int32(1)
+            if my >= Int32(0):
+                before = heads_below * Int32(bs)
+                pos = before + rank
+                packed_route_indices[pos] = u_me
+                if rank % Int32(bs) == Int32(0):
+                    block_expert_ids[pos // Int32(bs)] = my
+                if rank == cnt - Int32(1):
+                    seg_end = before + (cnt + Int32(bs - 1)) // Int32(bs) * Int32(bs)
+                    for s in cutlass.range_constexpr(bs - 1):
+                        q = pos + Int32(1 + s)
+                        if q < seg_end:
+                            packed_route_indices[q] = numel
+            if u_me == Int32(0):
+                packed_route_count[Int32(0)] = heads_total * Int32(bs)
+
+    @cute.jit
+    def _pack_routes_in_kernel_hist(
+        self,
+        route_ids_flat: cute.Tensor,
+        packed_route_indices: cute.Tensor,
+        block_expert_ids: cute.Tensor,
+        packed_route_count: cute.Tensor,
+        weight_num_experts: Int32,
+        smem_base: Int32,
+        tid: Int32,
+        cta: Int32,
+        grid_x: Int32,
+        active_m: cutlass.Int32,
+    ):
+        """Pack <= 256 routes (one per thread of the last CTA) by expert with a
+        shared-memory histogram (<= 1024 experts): rank = smem atomic count
+        taken one token at a time (route-index order inside an expert, like
+        the mode-1 packer), block offsets =
+        exclusive CTA scan of ceil(count / BS). Same layout as route_pack.py.
+        Uses the first 8 KB of the still-idle GEMM staging smem."""
+        bs = self.moe_block_size
+        numel = active_m * Int32(self.top_k)
+        lane = tid & Int32(31)
+        warp = tid >> Int32(5)
+        hist = smem_base
+        pref = smem_base + Int32(4096)
+        wsum = smem_base + Int32(8192)
+        if cta == grid_x - Int32(1):
+            for i in cutlass.range_constexpr(4):
+                st_shared_i32(hist + (tid + Int32(256 * i)) * Int32(4), Int32(0))
+            cute.arch.barrier(barrier_id=1, number_of_threads=256)
+            x = Int32(-1)
+            if tid < numel:
+                x = route_ids_flat[tid].to(Int32)
+                if x < Int32(0) or x >= weight_num_experts:
+                    x = Int32(-1)
+            # Token-sequential ranks: a token's top-k ids are distinct, so
+            # ranking one token per step makes the order inside an expert the
+            # route-index order (deterministic, same as the mode-1 packer).
+            rank = Int32(0)
+            my_token = tid // Int32(self.top_k)
+            for t in cutlass.range_constexpr(256 // self.top_k):
+                if Int32(t) * Int32(self.top_k) < numel:
+                    if my_token == Int32(t) and x >= Int32(0):
+                        rank = atomic_add_shared_i32(hist + x * Int32(4), Int32(1))
+                    cute.arch.barrier(barrier_id=1, number_of_threads=256)
+            v = cute.make_rmem_tensor((4,), Int32)
+            run = Int32(0)
+            for i in cutlass.range_constexpr(4):
+                c = ld_shared_i32(hist + (tid * Int32(4) + Int32(i)) * Int32(4))
+                v[i] = (c + Int32(bs - 1)) // Int32(bs)
+                run += v[i]
+            incl = run
+            for k in cutlass.range_constexpr(5):
+                y = cute.arch.shuffle_sync_up(incl, offset=1 << k, mask_and_clamp=0)
+                if lane >= Int32(1 << k):
+                    incl += y
+            if lane == Int32(31):
+                st_shared_i32(wsum + warp * Int32(4), incl)
+            cute.arch.barrier(barrier_id=1, number_of_threads=256)
+            warp_off = Int32(0)
+            heads_total = Int32(0)
+            for w in cutlass.range_constexpr(8):
+                ws = ld_shared_i32(wsum + Int32(w * 4))
+                heads_total += ws
+                if Int32(w) < warp:
+                    warp_off += ws
+            base = warp_off + incl - run
+            for i in cutlass.range_constexpr(4):
+                st_shared_i32(pref + (tid * Int32(4) + Int32(i)) * Int32(4), base)
+                base += v[i]
+            cute.arch.barrier(barrier_id=1, number_of_threads=256)
+            if x >= Int32(0):
+                cnt = ld_shared_i32(hist + x * Int32(4))
+                before = ld_shared_i32(pref + x * Int32(4)) * Int32(bs)
+                pos = before + rank
+                packed_route_indices[pos] = tid
+                if rank % Int32(bs) == Int32(0):
+                    block_expert_ids[pos // Int32(bs)] = x
+                if rank == cnt - Int32(1):
+                    seg_end = before + (cnt + Int32(bs - 1)) // Int32(bs) * Int32(bs)
+                    for s in cutlass.range_constexpr(bs - 1):
+                        q = before + cnt + Int32(s)
+                        if q < seg_end:
+                            packed_route_indices[q] = numel
+            if tid == Int32(0):
+                packed_route_count[Int32(0)] = heads_total * Int32(bs)
 
     @cute.jit
     def _grid_barrier(
@@ -1592,7 +2000,12 @@ class W4A16FusedMoeKernel:
         warps_per_cta = Int32(self.cta_threads // 32)
         nblk = Int32(self.hidden_size // 512)
         live_routes = active_m * Int32(self.top_k)
-        route_count = packed_route_count[Int32(0)].to(Int32)
+        if cutlass.const_expr(self.inkernel_route_pack):
+            # The packed count is produced concurrently; the shared input
+            # rotation only needs active_m.
+            route_count = active_m
+        else:
+            route_count = packed_route_count[Int32(0)].to(Int32)
         if cutlass.const_expr(self.direct_topk_routes):
             route_count = live_routes
         if cutlass.const_expr(self.shared_input_rotation):
@@ -1682,6 +2095,17 @@ class W4A16FusedMoeKernel:
                 x33 = cutlass.Float16(
                     x_input_flat[x_base + Int32(387)].to(cutlass.Float32)
                 ).to(cutlass.Float32)
+                if cutlass.const_expr(self.prefetch_sides):
+                    if cutlass.const_expr(self.broadcast_suh):
+                        ps_base = col0
+                    else:
+                        ps_base = expert * Int32(self.hidden_size) + col0
+                    pre_s = cute.make_rmem_tensor((16,), cutlass.Float32)
+                    for gi in cutlass.range_constexpr(4):
+                        for ri in cutlass.range_constexpr(4):
+                            pre_s[gi * 4 + ri] = suh_flat[
+                                ps_base + Int32(gi * 128 + ri)
+                            ].to(cutlass.Float32)
 
                 h00, h01, h02, h03 = self._had128_quad(x00, x01, x02, x03, lane)
                 h10, h11, h12, h13 = self._had128_quad(x10, x11, x12, x13, lane)
@@ -1710,10 +2134,16 @@ class W4A16FusedMoeKernel:
                         c0, c1, c2, c3 = c20, c21, c22, c23
                     else:
                         c0, c1, c2, c3 = c30, c31, c32, c33
-                    s0 = suh_flat[s_base + offset + Int32(0)].to(cutlass.Float32)
-                    s1 = suh_flat[s_base + offset + Int32(1)].to(cutlass.Float32)
-                    s2 = suh_flat[s_base + offset + Int32(2)].to(cutlass.Float32)
-                    s3 = suh_flat[s_base + offset + Int32(3)].to(cutlass.Float32)
+                    if cutlass.const_expr(self.prefetch_sides):
+                        s0 = pre_s[group * 4 + 0]
+                        s1 = pre_s[group * 4 + 1]
+                        s2 = pre_s[group * 4 + 2]
+                        s3 = pre_s[group * 4 + 3]
+                    else:
+                        s0 = suh_flat[s_base + offset + Int32(0)].to(cutlass.Float32)
+                        s1 = suh_flat[s_base + offset + Int32(1)].to(cutlass.Float32)
+                        s2 = suh_flat[s_base + offset + Int32(2)].to(cutlass.Float32)
+                        s3 = suh_flat[s_base + offset + Int32(3)].to(cutlass.Float32)
                     c0 = cutlass.Float16(c0 * s0).to(cutlass.Float32)
                     c1 = cutlass.Float16(c1 * s1).to(cutlass.Float32)
                     c2 = cutlass.Float16(c2 * s2).to(cutlass.Float32)
@@ -1724,6 +2154,41 @@ class W4A16FusedMoeKernel:
                     a_shared_flat[out_base + offset + Int32(2)] = cutlass.Float16(o2)
                     a_shared_flat[out_base + offset + Int32(3)] = cutlass.Float16(o3)
             unit += gw_stride
+
+    @cute.jit
+    def _pre_quad_offsets(self, row: Int32, expert: Int32, pre_block: Int32, lane: Int32):
+        """Address part of _load_intermediate_hadamard_pre_quad (uniform-rate layout)."""
+        chunk = lane >> Int32(3)
+        chunk_lane = lane & Int32(7)
+        channel_group = pre_block * Int32(2) + (chunk >> Int32(1))
+        slot = chunk & Int32(1)
+        coord = channel_group * Int32(32) + chunk_lane * Int32(4)
+        isz = Int32(self.intermediate_size)
+        fc1_base = row * Int32(2 * self.intermediate_size) + slot * isz + coord
+        rot_base = expert * Int32(6 * self.intermediate_size)
+        scale_base = rot_base + slot * isz + coord
+        sign_base = (
+            rot_base
+            + Int32(3 * self.intermediate_size)
+            + pre_block * Int32(128)
+            + lane * Int32(4)
+        )
+        return fc1_base, scale_base, sign_base
+
+    @cute.jit
+    def _pre_quad_compute(self, pre: cute.Tensor, base: cutlass.Constexpr[int], lane: Int32):
+        """Arithmetic part of _load_intermediate_hadamard_pre_quad, same op order."""
+        h0, h1, h2, h3 = self._had128_quad(pre[base + 0], pre[base + 1], pre[base + 2], pre[base + 3], lane)
+        h0 *= pre[base + 4]
+        h1 *= pre[base + 5]
+        h2 *= pre[base + 6]
+        h3 *= pre[base + 7]
+        h0, h1, h2, h3 = self._had128_quad(h0, h1, h2, h3, lane)
+        h0 *= pre[base + 8]
+        h1 *= pre[base + 9]
+        h2 *= pre[base + 10]
+        h3 *= pre[base + 11]
+        return h0, h1, h2, h3
 
     @cute.jit
     def _load_intermediate_hadamard_pre_quad(
@@ -1796,6 +2261,8 @@ class W4A16FusedMoeKernel:
         cta: Int32,
         grid_x: Int32,
         active_m: cutlass.Int32,
+        flow_live: Int32,
+        flow_ctr: Int64,
     ):
         """Recover interleaved gate/up, evaluate SiTU, and prepare FC2."""
 
@@ -1814,6 +2281,16 @@ class W4A16FusedMoeKernel:
         while unit < total_units:
             route_pos = unit // nblk
             post_block = unit - route_pos * nblk
+            if cutlass.const_expr(self.flow_flags and not self.prefetch_sides):
+                if flow_live != Int32(0):
+                    # Wait for every FC1 n-tile of this route block (every
+                    # lane acquires, so its own FC1 loads are ordered).
+                    fc1_addr = flow_ctr + Int64(
+                        route_pos // Int32(self.moe_block_size)
+                    ) * Int64(4)
+                    got = Int32(-1)
+                    while got != Int32(self.fc1.n_tiles):
+                        got = ld_global_acquire_i32(fc1_addr)
             row = packed_route_indices[route_pos].to(Int32)
             expert = block_expert_ids[route_pos // Int32(self.moe_block_size)].to(Int32)
             if cutlass.const_expr(self.direct_topk_routes):
@@ -1831,12 +2308,62 @@ class W4A16FusedMoeKernel:
                 and expert < weight_num_experts
             ):
                 p0 = post_block * Int32(2)
-                a0, a1, a2, a3 = self._load_intermediate_hadamard_pre_quad(
-                    fc1_flat, rotations_flat, row, expert, p0, lane
-                )
-                b0, b1, b2, b3 = self._load_intermediate_hadamard_pre_quad(
-                    fc1_flat, rotations_flat, row, expert, p0 + Int32(1), lane
-                )
+                if cutlass.const_expr(self.prefetch_sides):
+                    isz_p = Int32(self.intermediate_size)
+                    rot_base_p = expert * Int32(6 * self.intermediate_size)
+                    col0_p = post_block * Int32(128) + lane * Int32(4)
+                    pre = cute.make_rmem_tensor((32,), cutlass.Float32)
+                    if cutlass.const_expr(self.flow_flags):
+                        # Flow build: issue the FC1-independent rotation
+                        # tables first, then wait for the route block's FC1
+                        # tiles, then load the FC1 values (same values, same
+                        # arithmetic as below).
+                        for half_i in cutlass.range_constexpr(2):
+                            fb, sb, gb = self._pre_quad_offsets(row, expert, p0 + Int32(half_i), lane)
+                            for ri in cutlass.range_constexpr(4):
+                                pre[half_i * 12 + 4 + ri] = rotations_flat[sb + Int32(ri)].to(cutlass.Float32)
+                                pre[half_i * 12 + 8 + ri] = rotations_flat[gb + Int32(ri)].to(cutlass.Float32)
+                        for ri in cutlass.range_constexpr(4):
+                            pre[24 + ri] = rotations_flat[
+                                rot_base_p + Int32(5 * self.intermediate_size) + col0_p + Int32(ri)
+                            ].to(cutlass.Float32)
+                            pre[28 + ri] = rotations_flat[
+                                rot_base_p + Int32(2 * self.intermediate_size) + col0_p + Int32(ri)
+                            ].to(cutlass.Float32)
+                        if flow_live != Int32(0):
+                            fc1_addr = flow_ctr + Int64(
+                                route_pos // Int32(self.moe_block_size)
+                            ) * Int64(4)
+                            got = Int32(-1)
+                            while got != Int32(self.fc1.n_tiles):
+                                got = ld_global_acquire_i32(fc1_addr)
+                        for half_i in cutlass.range_constexpr(2):
+                            fb, sb, gb = self._pre_quad_offsets(row, expert, p0 + Int32(half_i), lane)
+                            for ri in cutlass.range_constexpr(4):
+                                pre[half_i * 12 + ri] = fc1_flat[fb + Int32(ri)].to(cutlass.Float32)
+                    else:
+                        for half_i in cutlass.range_constexpr(2):
+                            fb, sb, gb = self._pre_quad_offsets(row, expert, p0 + Int32(half_i), lane)
+                            for ri in cutlass.range_constexpr(4):
+                                pre[half_i * 12 + ri] = fc1_flat[fb + Int32(ri)].to(cutlass.Float32)
+                                pre[half_i * 12 + 4 + ri] = rotations_flat[sb + Int32(ri)].to(cutlass.Float32)
+                                pre[half_i * 12 + 8 + ri] = rotations_flat[gb + Int32(ri)].to(cutlass.Float32)
+                        for ri in cutlass.range_constexpr(4):
+                            pre[24 + ri] = rotations_flat[
+                                rot_base_p + Int32(5 * self.intermediate_size) + col0_p + Int32(ri)
+                            ].to(cutlass.Float32)
+                            pre[28 + ri] = rotations_flat[
+                                rot_base_p + Int32(2 * self.intermediate_size) + col0_p + Int32(ri)
+                            ].to(cutlass.Float32)
+                    a0, a1, a2, a3 = self._pre_quad_compute(pre, 0, lane)
+                    b0, b1, b2, b3 = self._pre_quad_compute(pre, 12, lane)
+                else:
+                    a0, a1, a2, a3 = self._load_intermediate_hadamard_pre_quad(
+                        fc1_flat, rotations_flat, row, expert, p0, lane
+                    )
+                    b0, b1, b2, b3 = self._load_intermediate_hadamard_pre_quad(
+                        fc1_flat, rotations_flat, row, expert, p0 + Int32(1), lane
+                    )
                 if cutlass.const_expr(self.activation_is_situ):
                     beta = cutlass.Float32(SITU_DEFAULT_BETA)
                     linear_beta = cutlass.Float32(SITU_DEFAULT_LINEAR_BETA)
@@ -1891,24 +2418,50 @@ class W4A16FusedMoeKernel:
                 isz = Int32(self.intermediate_size)
                 col0 = post_block * Int32(128) + lane * Int32(4)
                 rot_base = expert * Int32(6 * self.intermediate_size)
-                sign_base = rot_base + Int32(5 * self.intermediate_size) + col0
-                v0 *= rotations_flat[sign_base + Int32(0)].to(cutlass.Float32)
-                v1 *= rotations_flat[sign_base + Int32(1)].to(cutlass.Float32)
-                v2 *= rotations_flat[sign_base + Int32(2)].to(cutlass.Float32)
-                v3 *= rotations_flat[sign_base + Int32(3)].to(cutlass.Float32)
-                v0, v1, v2, v3 = self._had128_quad(v0, v1, v2, v3, lane)
+                if cutlass.const_expr(self.prefetch_sides):
+                    v0 *= pre[24]
+                    v1 *= pre[25]
+                    v2 *= pre[26]
+                    v3 *= pre[27]
+                    v0, v1, v2, v3 = self._had128_quad(v0, v1, v2, v3, lane)
+                    v0 *= pre[28]
+                    v1 *= pre[29]
+                    v2 *= pre[30]
+                    v3 *= pre[31]
+                    v0, v1, v2, v3 = self._had128_quad(v0, v1, v2, v3, lane)
+                else:
+                    sign_base = rot_base + Int32(5 * self.intermediate_size) + col0
+                    v0 *= rotations_flat[sign_base + Int32(0)].to(cutlass.Float32)
+                    v1 *= rotations_flat[sign_base + Int32(1)].to(cutlass.Float32)
+                    v2 *= rotations_flat[sign_base + Int32(2)].to(cutlass.Float32)
+                    v3 *= rotations_flat[sign_base + Int32(3)].to(cutlass.Float32)
+                    v0, v1, v2, v3 = self._had128_quad(v0, v1, v2, v3, lane)
 
-                down_base = rot_base + Int32(2 * self.intermediate_size) + col0
-                v0 *= rotations_flat[down_base + Int32(0)].to(cutlass.Float32)
-                v1 *= rotations_flat[down_base + Int32(1)].to(cutlass.Float32)
-                v2 *= rotations_flat[down_base + Int32(2)].to(cutlass.Float32)
-                v3 *= rotations_flat[down_base + Int32(3)].to(cutlass.Float32)
-                v0, v1, v2, v3 = self._had128_quad(v0, v1, v2, v3, lane)
+                    down_base = rot_base + Int32(2 * self.intermediate_size) + col0
+                    v0 *= rotations_flat[down_base + Int32(0)].to(cutlass.Float32)
+                    v1 *= rotations_flat[down_base + Int32(1)].to(cutlass.Float32)
+                    v2 *= rotations_flat[down_base + Int32(2)].to(cutlass.Float32)
+                    v3 *= rotations_flat[down_base + Int32(3)].to(cutlass.Float32)
+                    v0, v1, v2, v3 = self._had128_quad(v0, v1, v2, v3, lane)
                 out_base = row * isz + col0
                 activated_flat[out_base + Int32(0)] = self._cast_elem(v0)
                 activated_flat[out_base + Int32(1)] = self._cast_elem(v1)
                 activated_flat[out_base + Int32(2)] = self._cast_elem(v2)
                 activated_flat[out_base + Int32(3)] = self._cast_elem(v3)
+            if cutlass.const_expr(self.flow_flags):
+                if flow_live != Int32(0):
+                    threadfence()
+                    cute.arch.sync_warp()
+                    if (tid & Int32(31)) == Int32(0):
+                        red_add_global_release_i32(
+                            flow_ctr
+                            + Int64(
+                                self.flow_max_blocks
+                                + route_pos // Int32(self.moe_block_size)
+                            )
+                            * Int64(4),
+                            Int32(1),
+                        )
             unit += gw_stride
 
     @cute.jit

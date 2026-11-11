@@ -167,6 +167,26 @@ def test_fused_kimi_projection_shards_reject_tp9(owner):
         TUNING.validate_query(query, None)
 
 
+@pytest.mark.parametrize("owner", ["DcpAllToAll", "DcpAllToAllPool"])
+def test_fused_kimi_projection_shards_accept_tp9_push_plans_only(owner):
+    """The push transport clips the padded last shard; worlds without it stay rejected."""
+
+    def query(world, **call):
+        return PcieQuery(
+            surface=f"{owner}.all_gather_pair_kimi_topk",
+            world_size=world,
+            rank=0,
+            topology="pcie_ipc",
+            call=FrozenMapping(call),
+            setup=FrozenMapping(),
+        )
+
+    TUNING.validate_query(query(9, pair_transport="push"), None)
+    for world in (10, 12):
+        with pytest.raises(ValueError, match="supports world sizes"):
+            TUNING.validate_query(query(world, pair_transport="push"), None)
+
+
 @pytest.mark.parametrize("world", [10, 12])
 @pytest.mark.parametrize("owner", ["DcpAllToAll", "DcpAllToAllPool"])
 @pytest.mark.parametrize(

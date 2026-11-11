@@ -23,6 +23,13 @@ from torch.distributed import ProcessGroup
 from b12x.preparation.types import Plan, require_prepared
 
 from ._dma_kernels import DmaKernels
+from ._dma_tree import (
+    ISSUE_ORDER as TREE_ISSUE_ORDER,
+    STREAMS as TREE_STREAMS,
+    program as tree_program,
+    schedule as tree_schedule,
+    topology as tree_topology,
+)
 from ._cuda_ipc import CudaRTLibrary
 from .pcie_oneshot import PCIeOneshotAllReduce, _normalize_device
 
@@ -39,6 +46,46 @@ FLAG_SLOTS = 256
 MAX_PIECES = 8
 SCRATCH_ALIGN = 256
 FP8_QUANT_BLOCK = 128
+# Tree all-reduce (_dma_tree): a schedule per piece count, each with its own bank of flag slots
+# and counters, because a flag's sender and its position among that sender's copies depend on
+# the schedule.
+TREE_PIECES = (1, 2, 4)
+TREE_BANK_SLOTS = 128
+TREE_BANK_SENDS = 256
+TREE_MIN_PIECE_BYTES = 256 << 10
+# Pieces a ring all-gather splits a segment into. One keeps every link busy: a hop of a segment
+# starts when the hop before it arrived, and the hops of the other segments fill the same time.
+GATHER_PIECES = 1
+
+# Per-shape ring pieces for prefill reductions at world 8, measured on an 8-GPU
+# two-switch PCIe box (every shape in
+# prefill_capacities(3072) x {3584, 7168} cols, pieces 1/2/4/8, median of
+# 5x20 launches). The ring's time is stepped and pieces matter per shape:
+# pieces 1 wins everywhere except the two largest 7168-col reductions
+# (2560x7168: 1.207 ms at 2 vs 1.367 at 1; 3072x7168: 1.436 vs 1.637). At the
+# 3584-col shapes 1 piece is 25-48% faster than 2 (3072x3584: 0.891 vs 1.185;
+# 2048x3584: 0.645 vs 1.187). An earlier "0.88 ms at 8 pieces" reading for
+# (3072x3584) was this same 1-piece path: the 512 KiB minimum piece size makes
+# the old constant-2 (and any deep override) fall back to 1 there. pieces=1
+# also halves graph-node cost (128 KiB vs 224 KiB per launch, K=64 capture).
+# See _pick_pieces for the selection rules and the override semantics.
+SHAPE_PIECES: dict[tuple[int, int], int] = {
+    (128, 3584): 1, (128, 7168): 1,
+    (256, 3584): 1, (256, 7168): 1,
+    (512, 3584): 1, (512, 7168): 1,
+    (1024, 3584): 1, (1024, 7168): 1,
+    (1536, 3584): 1, (1536, 7168): 1,
+    (2048, 3584): 1, (2048, 7168): 1,
+    (2560, 3584): 1, (2560, 7168): 2,
+    (3072, 3584): 1, (3072, 7168): 2,
+}
+
+
+# Ring pieces at world 9 by the elements each rank holds of one reduced packet, and tree pieces by
+# the elements of one owner chunk. An absent size keeps the default rule of its transport. The
+# entries are measurements of one rig (nine GPUs on four leaf pairs and a single GPU, Gen4 x16).
+RING_PIECES_WORLD9: dict[int, int] = {}
+TREE_PIECES_BY_CHUNK: dict[int, int] = {}
 
 
 def _eager_replay_capacities(
@@ -226,6 +273,13 @@ class PCIeDmaAllReduce:
     reduce-scatter but rounds each fully reduced owner chunk once to BF16 and
     broadcasts those bits, halving the all-gather wire. Callers that store the
     FP32 result in BF16 receive the identical bits.
+
+    bf16_first_hop=True is the caller's declaration that every FP32 packet it
+    reduces holds BF16-representable values. The first reduce hop, which
+    carries a rank's own input chunk, then travels as those BF16 values and
+    the receiver adds them to its FP32 input with the tree channel's
+    accumulate kernel: the same two addends and the same FP32 sum as the
+    FP32 hop, with half the bytes on that hop.
     """
 
     def __init__(
@@ -237,6 +291,8 @@ class PCIeDmaAllReduce:
         ext_module=None,
         fp8: Optional[str] = None,
         bf16_gather: bool = False,
+        bf16_first_hop: bool = False,
+        tree: Optional[str] = None,
         ipc=None,
     ) -> None:
         # Kept only as a source-compatible keyword for callers that used to
@@ -273,12 +329,56 @@ class PCIeDmaAllReduce:
         )
         steps = 2 * (self.world_size - 1)
         flags_bytes = FLAG_SLOTS * FLAG_STRIDE
-        slab_bytes = flags_bytes + steps * self.shard_capacity
+        scratch_bytes = steps * self.shard_capacity
+        tree_flags_bytes = 0
+        self._tree = None
+        if tree:
+            # A tree channel reduces BF16 tensors of at most max_bytes in place of the ring.
+            # Its scratch holds what a rank receives in one reduction: BF16 values to sum, FP32
+            # partials and the other owners' results.
+            self._tree = tree_topology(tree)
+            if self._tree.world_size != self.world_size:
+                raise ValueError(
+                    f"tree topology {tree!r} is defined for {self._tree.world_size} ranks, "
+                    f"not {self.world_size}"
+                )
+            plans = [tree_schedule(self._tree, pieces) for pieces in TREE_PIECES]
+            for plan in plans:
+                sends = [0] * self.world_size
+                for edge in plan.edges:
+                    sends[edge.source] += 1
+                if plan.flag_slots > TREE_BANK_SLOTS or max(sends) > TREE_BANK_SENDS:
+                    raise ValueError("tree schedule exceeds its flag bank")
+            chunk_bytes = (self.max_bytes + self.world_size - 1) // self.world_size
+            self._tree_arena_bytes = _align_up(
+                max(
+                    -(-max(plan.scratch_units) * chunk_bytes // plan.pieces)
+                    for plan in plans
+                )
+                + len(plans[-1].edges) * 16,
+                SCRATCH_ALIGN,
+            )
+            self._tree_stage_bytes = _align_up(
+                max(
+                    -(-max(plan.stage_units) * chunk_bytes // plan.pieces)
+                    for plan in plans
+                )
+                + SCRATCH_ALIGN,
+                SCRATCH_ALIGN,
+            )
+            scratch_bytes = self._tree_arena_bytes
+            # One more slot than the banks hold: the flag a rank primes its kernels with.
+            tree_flags_bytes = (len(TREE_PIECES) * TREE_BANK_SLOTS + 1) * FLAG_STRIDE
+        slab_bytes = flags_bytes + scratch_bytes + tree_flags_bytes
+        self._slab_nbytes = slab_bytes
         self._slab = PCIeOneshotAllReduce._allocate_shared_buffer(
             exchange_group, slab_bytes, zero_fill=True, ipc=self._ipc
         )
         self._flags_base = list(self._slab.peer_ptrs)
         self._scratch_base = [ptr + flags_bytes for ptr in self._slab.peer_ptrs]
+        self._tree_flags_base = [
+            ptr + flags_bytes + scratch_bytes for ptr in self._slab.peer_ptrs
+        ]
         # Device-resident monotonic counters: one per flag slot for the
         # publisher role and one for the waiter role.
         self._send_counters = torch.zeros(
@@ -338,6 +438,33 @@ class PCIeDmaAllReduce:
             self._bf16_stage = torch.empty(
                 stage_bytes, dtype=torch.uint8, device=self.device
             )
+        if bf16_first_hop and not self._bf16_gather:
+            raise ValueError("a BF16 first hop belongs to the BF16 broadcast ring")
+        self._bf16_first_hop = bool(bf16_first_hop)
+        self._tree_stage = None
+        if self._tree is not None:
+            if self._fp8 or self._bf16_gather:
+                raise ValueError(
+                    "a tree channel takes neither a compressed wire nor the ring's BF16 gather"
+                )
+            banks = len(TREE_PIECES)
+            self._tree_primed = False
+            self._tree_send_counters = torch.zeros(
+                banks * TREE_BANK_SENDS + 1, dtype=torch.int32, device=self.device
+            )
+            self._tree_wait_counters = torch.zeros(
+                banks * TREE_BANK_SLOTS + 1, dtype=torch.int32, device=self.device
+            )
+            self._tree_stage = torch.empty(
+                self._tree_stage_bytes, dtype=torch.uint8, device=self.device
+            )
+            self._tree_streams = {
+                name: torch.cuda.Stream(device=self.device)
+                for name in TREE_STREAMS
+                if name != "main"
+            }
+            # Persistent events per bank: captured graphs keep references to them.
+            self._tree_events = {pieces: [] for pieces in TREE_PIECES}
         self._pieces_override = int(os.getenv("B12X_PCIE_DMA_PIECES", "0"))
         self._a2a_chunks_override = int(os.getenv("B12X_PCIE_DMA_A2A_CHUNKS", "0"))
         self.min_bytes = 0
@@ -363,15 +490,40 @@ class PCIeDmaAllReduce:
     def _scratch_ptr(self, rank: int, step: int) -> int:
         return self._scratch_base[rank] + step * self.shard_capacity
 
-    def _pick_pieces(self, shard_elems: int, shard_bytes: int) -> int:
+    def _pick_pieces(
+        self, shard_elems: int, shard_bytes: int, shape: tuple[int, ...] | None = None
+    ) -> int:
         override = self._pieces_override
-        # pieces=2 measured best at every size (deeper chunking pays an
-        # extra wait+add launch chain per piece on the main stream).
-        candidates = (override,) if 1 <= override <= MAX_PIECES else (2,)
-        for pieces in candidates:
-            if shard_elems % (pieces * 8) == 0 and shard_bytes // pieces >= 512 << 10:
+
+        def usable(pieces: int) -> bool:
+            return (
+                shard_elems % (pieces * 8) == 0
+                and shard_bytes // pieces >= 512 << 10
+            )
+
+        if 1 <= override <= MAX_PIECES and usable(override):
+            return override
+        if self.world_size == 9:
+            pieces = RING_PIECES_WORLD9.get(int(shard_elems))
+            if pieces is not None and usable(pieces):
                 return pieces
-        return 1
+        # Per-shape ring pieces Measured at TP8 on an 8-GPU
+        # two-switch PCIe box: the ring's time is stepped in shard size and the
+        # best piece count differs per reduction shape -- 8 pieces wins at
+        # (3072x3584) while (3072x7168) is fastest at 2, and pieces 8 at
+        # (3072x7168) costs 4.53 ms against 1.44 at 2. The table is keyed by
+        # the reduction shape (rows, cols) at world 8, the only shape family
+        # measured; anything else keeps the previous constant-2 behaviour.
+        # B12X_PCIE_DMA_PIECES remains a hard override (all sizes) and must
+        # never be left set: it silently wrecks prefill (see w3-results.md).
+        if shape is not None and len(shape) == 2 and self.world_size == 8:
+            pieces = SHAPE_PIECES.get((int(shape[0]), int(shape[1])))
+            if pieces is not None and usable(pieces):
+                return pieces
+        # pieces=2 measured best at every size before per-shape selection
+        # (deeper chunking pays an extra wait+add launch chain per piece on
+        # the main stream).
+        return 2 if usable(2) else 1
 
     def should_allreduce(self, inp: torch.Tensor) -> bool:
         if self._closed or inp.device != self.device:
@@ -391,6 +543,12 @@ class PCIeDmaAllReduce:
         """True when the all-gather phase forwards a single BF16 owner rounding."""
 
         return self._bf16_gather
+
+    @property
+    def bf16_first_hop(self) -> bool:
+        """True when packets are declared BF16-valued and the first reduce hop carries BF16."""
+
+        return self._bf16_first_hop
 
     def prepare_eager_replay(
         self, dtype: torch.dtype, *, max_elements: int | None = None
@@ -517,6 +675,8 @@ class PCIeDmaAllReduce:
             raise ValueError(
                 "output must match input shape/dtype/device and be contiguous"
             )
+        if self._tree is not None:
+            return self._run_tree(inp, out)
         replays = self._eager_replays.get(inp.dtype)
         if replays is not None and not torch.cuda.is_current_stream_capturing():
             elements = inp.numel()
@@ -584,7 +744,7 @@ class PCIeDmaAllReduce:
         # sub-chunk c+1's copy overlaps sub-chunk c's wait+reduce. Deeper
         # chunking amortizes the flag round trip further as long as each
         # piece's copy time dominates the ~5us sub-step overhead.
-        pieces = self._pick_pieces(shard_elems, shard_bytes)
+        pieces = self._pick_pieces(shard_elems, shard_bytes, shape=tuple(inp.shape))
         if compressed_ag and (shard_elems // pieces) % FP8_QUANT_BLOCK != 0:
             pieces = 1
         piece_elems = shard_elems // pieces
@@ -835,9 +995,6 @@ class PCIeDmaAllReduce:
         add_done = self._piece_events
         copied = self._copied_events
         in_base, out_base = inp.data_ptr(), out.data_ptr()
-        self._input_ready.record(main)
-        copy_stream.wait_event(self._input_ready)
-        flag_stream.wait_event(self._input_ready)
 
         def piece_ptr(chunk: int, piece: int) -> int:
             return out_base + chunk * shard_bytes + piece * piece_bytes
@@ -857,6 +1014,21 @@ class PCIeDmaAllReduce:
         def slot(step: int, piece: int) -> int:
             return step * pieces + piece
 
+        first_hop = self._bf16_first_hop
+        if first_hop:
+            # The packet holds BF16 values: this rank's own chunk leaves as them.
+            for p in range(pieces):
+                _device_view(
+                    stage_piece(p), piece_elems, torch.bfloat16, self.device
+                ).copy_(
+                    _device_view(
+                        in_piece_ptr(rank, p), piece_elems, torch.float32, self.device
+                    )
+                )
+        self._input_ready.record(main)
+        copy_stream.wait_event(self._input_ready)
+        flag_stream.wait_event(self._input_ready)
+
         for k in range(steps):
             reduce_phase = k < world - 1
             if reduce_phase:
@@ -866,6 +1038,9 @@ class PCIeDmaAllReduce:
                 send_chunk = (rank + 1 - (k - (world - 1))) % world
                 recv_chunk = (rank - (k - (world - 1))) % world
             if k == world - 1:
+                if first_hop:
+                    # The stage fed this rank's first hop; those copies are done first.
+                    main.wait_event(copied[slot(0, pieces - 1)])
                 # The previous reduce step finalized this rank's owned chunk.
                 # Round it once; the first all-gather send waits on the event.
                 for p in range(pieces):
@@ -881,7 +1056,11 @@ class PCIeDmaAllReduce:
                     )
                 self._ag_ready.record(main)
             for p in range(pieces):
-                if reduce_phase:
+                if first_hop and k == 0:
+                    send_bytes = wire_bytes
+                    send_src = stage_piece(p)
+                    send_dst = scratch_wire(nxt, k, p)
+                elif reduce_phase:
                     send_bytes = piece_bytes
                     send_src = (
                         in_piece_ptr(send_chunk, p)
@@ -915,7 +1094,17 @@ class PCIeDmaAllReduce:
                     self._counter_ptr(self._wait_counters, slot(k, p)),
                     self._counter_ptr(self._wait_done, slot(k, p)),
                 )
-                if reduce_phase:
+                if first_hop and k == 0:
+                    # The previous rank's own chunk arrived as BF16 values.
+                    kernels.dma_wait_flag(*wait[:2])
+                    kernels.dma_tree_accum(
+                        piece_ptr(recv_chunk, p),
+                        [scratch_wire(rank, k, p)],
+                        [in_piece_ptr(recv_chunk, p)],
+                        piece_elems,
+                        False,
+                    )
+                elif reduce_phase:
                     kernels.dma_add(
                         piece_ptr(recv_chunk, p),
                         in_piece_ptr(recv_chunk, p),
@@ -951,6 +1140,381 @@ class PCIeDmaAllReduce:
         )
         return out
 
+    @property
+    def gather_capacity(self) -> int:
+        """Bytes of one rank's segment that the ring all-gather carries; zero on a tree channel."""
+
+        return 0 if self._tree is not None else int(self.shard_capacity)
+
+    def gather_slots(self, shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+        """This rank's view of an all-gather of one `shape` segment per rank.
+
+        The result is `[world, *shape]` over the channel's scratch. Slot `s` holds the segment
+        of rank `gather_rank(s)`, which is `(rank + 1 + s) % world`: the ranks in ring order
+        from this rank's successor, so the last slot is this rank's own segment. The caller
+        writes that slot, runs `all_gather`, reads every slot and then calls `release_gather`.
+        Until the release no reduction or gather may start on the channel.
+        """
+
+        elements = 1
+        for extent in shape:
+            if type(extent) is not int or extent <= 0:
+                raise ValueError("an all-gather segment has a positive shape")
+            elements *= extent
+        itemsize = int(dtype.itemsize)
+        if (
+            self._closed
+            or self._tree is not None
+            or elements * itemsize > self.shard_capacity
+            or elements * itemsize % 16
+            or self.shard_capacity % itemsize
+        ):
+            raise ValueError(
+                "an all-gather segment is a whole number of 16-byte packs within the "
+                "ring channel's shard capacity"
+            )
+        stride = self.shard_capacity // itemsize
+        flat = _device_view(
+            self._scratch_ptr(self.rank, 0),
+            (self.world_size - 1) * stride + elements,
+            dtype,
+            self.device,
+        )
+        inner, step = [], 1
+        for extent in reversed(shape):
+            inner.append(step)
+            step *= extent
+        return torch.as_strided(
+            flat, (self.world_size, *shape), (stride, *reversed(inner))
+        )
+
+    def gather_rank(self, slot: int) -> int:
+        """The rank whose segment `gather_slots` holds in `slot`."""
+
+        return (self.rank + 1 + int(slot)) % self.world_size
+
+    def all_gather(self, slots: torch.Tensor, *, plan: Plan) -> torch.Tensor:
+        """Fill `slots`, a `gather_slots` view whose last slot the caller wrote."""
+
+        state = require_prepared(plan, "comm.pcie", self.device)
+        if not hasattr(state, "require_runtime") or not hasattr(state, "run_gather"):
+            raise TypeError("plan does not contain a prepared DMA channel")
+        state.require_runtime(self)
+        return state.run_gather(slots)
+
+    def release_gather(self, *, plan: Plan) -> None:
+        """Let the neighbours reuse this rank's scratch: the gathered slots are dead afterwards."""
+
+        state = require_prepared(plan, "comm.pcie", self.device)
+        if not hasattr(state, "require_runtime") or not hasattr(state, "release_gather"):
+            raise TypeError("plan does not contain a prepared DMA channel")
+        state.require_runtime(self)
+        state.release_gather()
+
+    def _gather_segment_bytes(self, slots: torch.Tensor) -> int:
+        if (
+            slots.ndim < 2
+            or slots.shape[0] != self.world_size
+            or slots.device != self.device
+            or slots.data_ptr() != self._scratch_ptr(self.rank, 0)
+            or slots.stride(0) * slots.element_size() != self.shard_capacity
+        ):
+            raise ValueError("all_gather takes the view gather_slots returned")
+        nbytes = slots[0].numel() * slots.element_size()
+        if nbytes <= 0 or nbytes > self.shard_capacity or nbytes % 16:
+            raise ValueError("all_gather segment does not fit the channel")
+        return nbytes
+
+    def _run_gather(self, nbytes: int, *, pieces: Optional[int] = None) -> None:
+        """Ring all-gather of the first `nbytes` of every rank's last scratch slot.
+
+        Scratch slot `s` of a rank is the home of rank `(rank + 1 + s) % world`'s segment. At
+        hop `j` every rank copies its slot `world - 1 - j` into the next rank's slot
+        `world - 2 - j`: its own segment first, then what the previous rank delivered one hop
+        earlier. After `world - 1` hops every slot is filled, and every link direction has
+        carried one copy at a time for the whole gather. A hop of a piece starts when that
+        piece arrived, which the previous rank's flag announces. Bytes are copied, never
+        converted. The closing handshake of a reduction is left to `_release_gather`, so the
+        caller reads its slots before a neighbour may write them again.
+        """
+
+        if self._tree is not None or self._closed:
+            raise ValueError("the ring all-gather needs an open ring channel")
+        world, rank = self.world_size, self.rank
+        nxt = (rank + 1) % world
+        pieces = GATHER_PIECES if pieces is None else int(pieces)
+        if (
+            pieces not in (1, 2, 4, 8)
+            or nbytes <= 0
+            or nbytes > self.shard_capacity
+            or nbytes % (16 * pieces)
+        ):
+            raise ValueError(
+                "ring all-gather pieces are whole 16-byte packs of a segment within the "
+                "shard capacity"
+            )
+        piece_bytes = nbytes // pieces
+        kernels = self._kernels
+        main = torch.cuda.current_stream(self.device)
+        copy_stream, flag_stream = self._copy_stream, self._flag_stream
+        arrived, copied = self._piece_events, self._copied_events
+        self._input_ready.record(main)
+        copy_stream.wait_event(self._input_ready)
+        flag_stream.wait_event(self._input_ready)
+        for hop in range(world - 1):
+            source = self._scratch_ptr(rank, world - 1 - hop)
+            target = self._scratch_ptr(nxt, world - 2 - hop)
+            for piece in range(pieces):
+                slot = hop * pieces + piece
+                with torch.cuda.stream(copy_stream):
+                    if hop:
+                        copy_stream.wait_event(arrived[piece])
+                    kernels.dma_copy(
+                        target + piece * piece_bytes,
+                        source + piece * piece_bytes,
+                        piece_bytes,
+                    )
+                    copied[slot].record(copy_stream)
+                with torch.cuda.stream(flag_stream):
+                    flag_stream.wait_event(copied[slot])
+                    kernels.dma_set_flag(
+                        self._flag_ptr(nxt, slot),
+                        self._counter_ptr(self._send_counters, slot),
+                    )
+                kernels.dma_wait_flag(
+                    self._flag_ptr(rank, slot),
+                    self._counter_ptr(self._wait_counters, slot),
+                )
+                arrived[piece].record(main)
+        main.wait_stream(copy_stream)
+        main.wait_stream(flag_stream)
+
+    def _release_gather(self) -> None:
+        """A reduction's closing handshake: this rank is done with its scratch, and waits for its successor."""
+
+        world, rank = self.world_size, self.rank
+        done = FLAG_SLOTS - 2
+        self._kernels.dma_set_flag(
+            self._flag_ptr((rank - 1) % world, done),
+            self._counter_ptr(self._send_counters, done),
+        )
+        self._kernels.dma_wait_flag(
+            self._flag_ptr(rank, done), self._counter_ptr(self._wait_counters, done)
+        )
+
+    @property
+    def tree(self) -> Optional[str]:
+        """Name of the switch-tree topology this channel reduces over, or None for the ring."""
+
+        return None if self._tree is None else self._tree.name
+
+    def _tree_pieces(self, chunk_elems: int) -> int:
+        override = self._pieces_override
+        measured = TREE_PIECES_BY_CHUNK.get(int(chunk_elems))
+        candidates = (
+            (override,) if override in TREE_PIECES else (measured,) if measured else (2, 1)
+        )
+        for pieces in candidates:
+            if chunk_elems % (pieces * 8) == 0 and (
+                pieces == 1 or chunk_elems // pieces * 2 >= TREE_MIN_PIECE_BYTES
+            ):
+                return pieces
+        return 1
+
+    def _prime_tree(self) -> None:
+        """Load every kernel of the tree protocol into the context before its first reduction.
+
+        A launcher loads its module at its first call, and that load does not return while a
+        flag wait is polling on the device: a rank that issued a wait and then met an unloaded
+        accumulate kernel stopped there, before it had sent the values its peers were waiting
+        for. The calls here touch this rank's stage and a flag slot no schedule uses.
+        """
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("a tree channel runs once eagerly before it is captured in a graph")
+        kernels = self._kernels
+        banks = len(TREE_PIECES)
+        with torch.cuda.device(self.device):
+            flag = self._tree_flags_base[self.rank] + banks * TREE_BANK_SLOTS * FLAG_STRIDE
+            kernels.dma_set_flag(
+                flag, self._counter_ptr(self._tree_send_counters, banks * TREE_BANK_SENDS)
+            )
+            kernels.dma_wait_flag(
+                flag, self._counter_ptr(self._tree_wait_counters, banks * TREE_BANK_SLOTS)
+            )
+            stage = self._tree_stage.data_ptr()
+            kernels.dma_copy(stage, stage + 128, 16)
+            for (values, partials, final), _ in kernels._require_launchers().tree_accum:
+                kernels.dma_tree_accum(
+                    stage, [stage + 64] * values, [stage + 128] * partials, 8, final
+                )
+            torch.cuda.current_stream(self.device).synchronize()
+        self._tree_primed = True
+
+    def _run_tree(self, inp: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        """Single-rounding BF16 all-reduce over the channel's switch tree (_dma_tree).
+
+        Chunk c of the flat tensor (one of world_size equal chunks) is owned by
+        rank c. BF16 values travel to the rank that sums them, FP32 partial sums
+        to the owner, and the owner's one BF16 rounding along the broadcast tree;
+        every rank therefore holds identical bits. Input and output may be the
+        same tensor: a chunk's result reaches a rank only after that rank's own
+        values of the chunk have been summed somewhere.
+
+        No end handshake is needed. A rank returns after it has placed and
+        forwarded every result, and a peer overwrites a scratch region of this
+        rank only in a later reduction, whose transfers into that region all
+        depend on values this rank sends after it has returned.
+        """
+
+        if inp.dtype != torch.bfloat16:
+            raise ValueError("a tree channel reduces BF16 tensors")
+        if inp.data_ptr() % 16 or out.data_ptr() % 16:
+            raise ValueError("a tree channel reduces 16-byte aligned tensors")
+        if inp.data_ptr() != out.data_ptr() and (
+            inp.data_ptr() < out.data_ptr() + out.nbytes
+            and out.data_ptr() < inp.data_ptr() + inp.nbytes
+        ):
+            raise ValueError("tree input and output must be the same tensor or disjoint")
+        if not self._tree_primed:
+            self._prime_tree()
+        world, rank = self.world_size, self.rank
+        chunk_elems = inp.numel() // world
+        pieces = self._tree_pieces(chunk_elems)
+        plan = tree_schedule(self._tree, pieces)
+        piece_elems = chunk_elems // pieces
+        # One reduction normally fits the scratch; a larger one runs in element intervals.
+        capacity = min(
+            self._tree_arena_bytes // (max(plan.scratch_units) * 2),
+            self._tree_stage_bytes // (max(max(plan.stage_units), 1) * 2),
+        )
+        capacity -= capacity % 8
+        if capacity <= 0:
+            raise ValueError("tree scratch cannot hold one pack per transfer")
+        intervals = -(-piece_elems // capacity)
+        step = -(-piece_elems // intervals)
+        step += -step % 8
+        for first in range(0, piece_elems, step):
+            self._run_tree_interval(
+                plan, inp, out, chunk_elems, piece_elems, first, min(step, piece_elems - first)
+            )
+        return out
+
+    def _run_tree_interval(
+        self, plan, inp, out, chunk_elems: int, piece_elems: int, first: int, elems: int
+    ) -> None:
+        kernels = self._kernels
+        rank = self.rank
+        bank = TREE_PIECES.index(plan.pieces)
+        unit_bytes = elems * 2
+        in_base, out_base = inp.data_ptr(), out.data_ptr()
+        stage_base = self._tree_stage.data_ptr()
+        streams, event_count = tree_program(plan, rank)
+        events = self._tree_events[plan.pieces]
+        while len(events) < event_count:
+            events.append(torch.cuda.Event())
+        send_index = {}
+
+        def piece_ptr(base: int, chunk: int, piece: int) -> int:
+            return base + (chunk * chunk_elems + piece * piece_elems + first) * 2
+
+        def scratch_ptr(edge) -> int:
+            return self._scratch_base[edge.destination] + edge.offset * unit_bytes
+
+        def source_ptr(source) -> int:
+            if source[0] == "input":
+                return piece_ptr(in_base, source[1], source[2])
+            if source[0] == "output":
+                return piece_ptr(out_base, source[1], source[2])
+            if source[0] == "stage":
+                return stage_base + source[1] * unit_bytes
+            return scratch_ptr(source[1])
+
+        def flag_ptr(edge) -> int:
+            return (
+                self._tree_flags_base[edge.destination]
+                + (bank * TREE_BANK_SLOTS + edge.slot) * FLAG_STRIDE
+            )
+
+        def wait(edge) -> None:
+            kernels.dma_wait_flag(
+                flag_ptr(edge),
+                self._counter_ptr(
+                    self._tree_wait_counters, bank * TREE_BANK_SLOTS + edge.slot
+                ),
+            )
+
+        main = torch.cuda.current_stream(self.device)
+        self._input_ready.record(main)
+        for stream in self._tree_streams.values():
+            stream.wait_event(self._input_ready)
+        for name in TREE_ISSUE_ORDER:
+            operations = streams[name]
+            stream = main if name == "main" else self._tree_streams[name]
+            with torch.cuda.stream(stream):
+                for operation in operations:
+                    kind = operation[0]
+                    if kind == "copy":
+                        _, edge, source, after, copied = operation
+                        if after is not None:
+                            stream.wait_event(events[after])
+                        size = unit_bytes * (2 if edge.kind == "partial" else 1)
+                        kernels.dma_copy(scratch_ptr(edge), source_ptr(source), size)
+                        events[copied].record(stream)
+                    elif kind == "flag":
+                        _, edge, copied = operation
+                        stream.wait_event(events[copied])
+                        index = send_index.setdefault(
+                            (edge.destination, edge.slot), len(send_index)
+                        )
+                        kernels.dma_set_flag(
+                            flag_ptr(edge),
+                            self._counter_ptr(
+                                self._tree_send_counters, bank * TREE_BANK_SENDS + index
+                            ),
+                        )
+                    elif kind == "wait":
+                        wait(operation[1])
+                    elif kind == "accumulate":
+                        _, item, summed = operation
+                        arrived = {edge.source: scratch_ptr(edge) for edge in item.incoming}
+                        values = [
+                            piece_ptr(in_base, item.chunk, item.piece)
+                            if source == rank
+                            else arrived[source]
+                            for source in item.raws
+                        ]
+                        destination = (
+                            piece_ptr(out_base, item.chunk, item.piece)
+                            if item.final
+                            else stage_base + item.stage * unit_bytes
+                        )
+                        kernels.dma_tree_accum(
+                            destination,
+                            values,
+                            [scratch_ptr(edge) for edge in item.partials],
+                            elems,
+                            item.final,
+                        )
+                        events[summed].record(stream)
+                    elif kind == "mark":
+                        events[operation[1]].record(stream)
+                    elif kind == "place":
+                        receive = operation[1]
+                        _device_view(
+                            piece_ptr(out_base, receive.chunk, receive.piece),
+                            elems,
+                            torch.bfloat16,
+                            self.device,
+                        ).copy_(
+                            _device_view(
+                                scratch_ptr(receive.edge), elems, torch.bfloat16, self.device
+                            )
+                        )
+                    else:
+                        raise RuntimeError(f"unknown tree operation {kind!r}")
+        for stream in self._tree_streams.values():
+            main.wait_stream(stream)
+
     def _prime_prepared(self, state) -> None:
         """Prime selected code using this channel's fixed IPC buffers only."""
 
@@ -985,6 +1549,13 @@ class PCIeDmaAllReduce:
                         self._counter_ptr(self._wait_counters, slot),
                         self._counter_ptr(self._wait_done, slot),
                     ),
+                )
+            if self._bf16_first_hop:
+                # The first reduce hop adds BF16 values to FP32 input with the accumulate
+                # kernel; its first call must not follow a wait on this device.
+                stage = self._bf16_stage.data_ptr()
+                self._kernels.dma_tree_accum(
+                    stage, [stage + 64], [stage + 128], 8, False
                 )
             if self._fp8:
                 if self._fp8_stage is None or self._fp8_stage.numel() < 512:

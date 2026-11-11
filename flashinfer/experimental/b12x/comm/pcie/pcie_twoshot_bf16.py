@@ -373,20 +373,47 @@ class PCIeTwoShotBF16:
         del scale
         operation = state.query.call["operation"]
         payload_packs = payload.numel() // _PACK_ELEMS
+        transport = (
+            state.query.call["transport"] if operation == "all_reduce" else "push"
+        )
+        island = transport in ("island", "island_bf16", "island_overlap", "island_eighth")
         if operation == "all_gather":
             shard_packs = payload_packs
             total_packs = payload_packs * self.world_size
         else:
             total_packs = payload_packs
             shard_packs = (total_packs + self.world_size - 1) // self.world_size
+        if island:
+            # Quarter per island-local owner; regions are 2 * pack_stride packs.
+            if self.world_size != 8 or total_packs % 4:
+                raise ValueError("island two-shot needs world size 8 and whole quarters")
+            shard_packs = total_packs // 4
+        grid_packs = shard_packs
+        if transport == "island_overlap":
+            from ._twoshot_bf16_cute import (
+                _ISLAND_OVERLAP_STAGES,
+                island_overlap_fits,
+            )
+
+            if not island_overlap_fits(shard_packs, self._pack_stride):
+                raise ValueError("pcie_twoshot_bf16 staging capacity exceeded")
+            # The grid covers one pipeline sub-chunk of the quarter.
+            grid_packs = -(-shard_packs // _ISLAND_OVERLAP_STAGES)
+        if transport == "island_eighth":
+            from ._twoshot_bf16_cute import island_eighth_fits, island_eighth_sub_packs
+
+            if not island_eighth_fits(shard_packs, self._pack_stride):
+                raise ValueError("pcie_twoshot_bf16 staging capacity exceeded")
+            # The grid covers one half (eighth-owner) of a pipeline sub-chunk.
+            grid_packs = island_eighth_sub_packs(shard_packs) // 2
         if (
             int(threads) != state.query.call["threads"]
             or int(block_limit) != state.query.call["block_limit"]
         ):
             raise ValueError("two-shot launch controls differ from the prepared plan")
-        if shard_packs > self._pack_stride:
+        if shard_packs > self._pack_stride * (2 if island else 1):
             raise ValueError("pcie_twoshot_bf16 staging capacity exceeded")
-        blocks = max(1, min(int(block_limit), (shard_packs + threads - 1) // threads))
+        blocks = max(1, min(int(block_limit), (grid_packs + threads - 1) // threads))
         capturing = _is_current_stream_capturing(self.device)
         if capturing and self._capture_context_depth <= 0:
             raise RuntimeError("PCIe twoshot-bf16 capture requires runtime.capture()")
@@ -394,8 +421,8 @@ class PCIeTwoShotBF16:
             self._device_slot_bias = self._slot & 1
             self._device_slot_selection = True
         # Each native launch consumes one slot and one graph epoch.
-        pull = operation == "all_reduce" and state.query.call["transport"] == "pull"
-        if pull:
+        pull = operation == "all_reduce" and transport == "pull"
+        if pull or island:
             steps = (("all_reduce", payload, out),)
         elif operation == "all_reduce":
             shard = self._push_shard[: shard_packs * _PACK_ELEMS]
