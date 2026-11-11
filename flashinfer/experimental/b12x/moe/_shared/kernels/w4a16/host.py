@@ -280,6 +280,13 @@ def trellis_prefill_table_shape(m: int) -> dict | None:
     if mode not in ("1", "2"):
         return None
     m = int(m)
+    if mode == "2" and 1024 <= m < 1536:
+        return {
+            "block_size_m": 32,
+            "pipeline_stages": 2,
+            "trellis_decode_table": "full1",
+            "tile_config": (128, 128, 64, 256),
+        }
     if (mode == "1" and 1536 <= m <= 2560) or (mode == "2" and m >= 1536):
         return {
             "block_size_m": 48,
